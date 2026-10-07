@@ -1,0 +1,43 @@
+{
+  "name": "opencode-canvas",
+  "version": "1.0.0",
+  "description": "Every OpenCode session on one infinite, zoomable canvas, with a live tiled view of everything running.",
+  "keywords": [
+    "opencode",
+    "ai",
+    "coding-agent",
+    "agents",
+    "canvas",
+    "dashboard",
+    "bun"
+  ],
+  "homepage": "https://github.com/DevvGwardo/opencode-canvas#readme",
+  "bugs": {
+    "url": "https://github.com/DevvGwardo/opencode-canvas/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DevvGwardo/opencode-canvas.git"
+  },
+  "license": "MIT",
+  "author": "DevvGwardo",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "opencode-canvas": "./bin/opencode-canvas"
+  },
+  "scripts": {
+    "start": "bun bin/opencode-canvas",
+    "dev": "bun --hot bin/opencode-canvas --dev",
+    "demo": "bun bin/opencode-canvas --demo",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "engines": {
+    "bun": ">=1.2.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.6.0"
+  }
+}

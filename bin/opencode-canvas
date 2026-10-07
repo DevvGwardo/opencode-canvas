@@ -1,0 +1,72 @@
+#!/usr/bin/env bun
+import { parseArgs } from "node:util"
+import { startServer } from "../src/server/server"
+
+const { values } = parseArgs({
+  args: Bun.argv.slice(2),
+  options: {
+    port: { type: "string", short: "p" },
+    hostname: { type: "string" },
+    server: { type: "string" },
+    password: { type: "string" },
+    username: { type: "string" },
+    demo: { type: "boolean" },
+    dev: { type: "boolean" },
+    open: { type: "boolean" },
+    "no-autostart": { type: "boolean" },
+    help: { type: "boolean", short: "h" },
+  },
+  strict: true,
+})
+
+if (values.help) {
+  console.log(`opencode-canvas: every OpenCode v2 session on one infinite canvas
+
+Usage: opencode-canvas [options]
+
+  -p, --port <n>        Port to listen on (default 4317, 0 = random)
+      --hostname <h>    Interface to bind (default 127.0.0.1)
+      --server <url>    OpenCode server URL (default: the background service)
+      --password <pw>   Server password (default: OPENCODE_SERVER_PASSWORD or service.json)
+      --username <u>    Server username (default: opencode)
+      --demo            Run with simulated sessions, no OpenCode needed
+      --open            Open the canvas in your browser
+      --no-autostart    Don't start the OpenCode background service if it's stopped
+      --dev             Hot reload the UI while editing
+  -h, --help            Show this help`)
+  process.exit(0)
+}
+
+const hostname = values.hostname ?? "127.0.0.1"
+if (hostname !== "127.0.0.1" && hostname !== "localhost" && hostname !== "::1") {
+  console.warn(
+    `\x1b[33mwarning:\x1b[0m binding to ${hostname} exposes your OpenCode server (which can run shell commands) to the network with no extra auth.`,
+  )
+}
+
+try {
+  const { server, upstream, upstreamError } = await startServer({
+    port: values.port !== undefined ? Number(values.port) : Number(process.env.PORT ?? 4317),
+    hostname,
+    server: values.server,
+    password: values.password,
+    username: values.username,
+    demo: !!values.demo,
+    dev: !!values.dev,
+    autostart: !values["no-autostart"],
+  })
+  const url = `http://${hostname === "::1" ? "[::1]" : hostname}:${server.port}`
+  const up = upstream()
+  console.log(`\x1b[1mopencode-canvas\x1b[0m  ${url}`)
+  if (values.demo) console.log("  mode      simulated sessions (demo)")
+  else if (up) console.log(`  opencode  ${up.url}${up.password ? "  (authenticated)" : ""}`)
+  else console.log(`  opencode  \x1b[31munavailable\x1b[0m  ${upstreamError() ?? ""}`)
+  if (values.open) Bun.spawn([process.platform === "darwin" ? "open" : "xdg-open", url], { stdio: ["ignore", "ignore", "ignore"] })
+} catch (e) {
+  const msg = (e as Error).message
+  console.error(`opencode-canvas: ${msg}`)
+  if (/in use|EADDRINUSE/i.test(msg)) {
+    console.error(`  Another copy is probably running: open it, stop it with \`pkill -f opencode-canvas\`, or pass --port <n>.`)
+  }
+  process.exit(1)
+}
