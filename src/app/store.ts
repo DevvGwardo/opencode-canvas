@@ -104,8 +104,9 @@ export class Store {
         const wasReconnecting = this.connection === "reconnecting"
         this.connection = this.backend.kind === "demo" ? "demo" : s
         for (const l of this.listeners) l.connection?.(this.connection)
-        // Events were missed while disconnected: resync everything.
-        if (s === "live" && wasReconnecting) void this.reload()
+        // Events were missed while disconnected: resync everything. A failed
+        // resync is retried by refreshRecent/syncActive.
+        if (s === "live" && wasReconnecting) this.reload().catch(() => {})
       },
     )
     await this.reload()
@@ -170,7 +171,9 @@ export class Store {
     this.sessions = new Map(sessions.filter((s) => !s.time.archived).map((s) => [s.id, s]))
     this.rebuildChildren()
     this.running = active
-    for (const id of this.running) this.syncAsks(id)
+    // Asks answered elsewhere while we were disconnected would otherwise stay
+    // pending here forever, so recheck those as well as running sessions.
+    for (const id of new Set([...active, ...this.permissions.keys(), ...this.forms.keys()])) void this.syncAsks(id)
     this.previewStale = new Set(this.previews.keys())
     this.loaded = true
     this.markStructure()

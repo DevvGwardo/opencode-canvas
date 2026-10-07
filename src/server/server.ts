@@ -10,6 +10,8 @@ export interface ServerOptions extends UpstreamOptions {
   hostname: string
   demo: boolean
   dev: boolean
+  /** Don't log upstream connection changes (tests). */
+  quiet?: boolean
 }
 
 const HOP_HEADERS = new Set([
@@ -35,6 +37,15 @@ export async function startServer(opts: ServerOptions) {
   let upstream: Upstream | undefined
   let upstreamError: string | undefined
   let resolving: Promise<Upstream | undefined> | undefined
+  let lastLogged: string | undefined
+
+  // One line per connection change, so the terminal shows when OpenCode drops
+  // or moves without logging every request.
+  function logState(line: string) {
+    if (opts.quiet || line === lastLogged) return
+    lastLogged = line
+    console.log(`  ${new Date().toLocaleTimeString()}  ${line}`)
+  }
 
   async function getUpstream(force = false): Promise<Upstream | undefined> {
     if (opts.demo) return undefined
@@ -47,6 +58,7 @@ export async function startServer(opts: ServerOptions) {
       })
       .catch((e: Error) => {
         upstreamError = e.message
+        logState(`opencode  \x1b[31munavailable\x1b[0m  ${e.message}`)
         return undefined
       })
       .finally(() => {
@@ -102,6 +114,7 @@ export async function startServer(opts: ServerOptions) {
           redirect: "manual",
           decompress: !isStream,
         })
+        if (lastLogged) logState(`opencode  connected  ${up.url}`)
         const out = new Headers(res.headers)
         out.delete("content-encoding")
         out.delete("content-length")
@@ -114,6 +127,7 @@ export async function startServer(opts: ServerOptions) {
         if (req.signal.aborted) return new Response(null, { status: 499 })
         // The service may have restarted on a new port: rediscover once.
         upstreamError = (e as Error).message
+        logState(`opencode  lost ${up.url}  ${upstreamError}`)
         upstream = undefined
       }
     }
@@ -136,7 +150,10 @@ export async function startServer(opts: ServerOptions) {
         let version: string | undefined
         if (up) {
           try {
-            const res = await fetch(up.url + "/api/info", { headers: { authorization: authHeader(up) ?? "" } })
+            const res = await fetch(up.url + "/api/info", {
+              headers: { authorization: authHeader(up) ?? "" },
+              signal: AbortSignal.timeout(5_000),
+            })
             if (res.ok) version = (await res.json())?.version
             else upstreamError = `OpenCode responded ${res.status} to /api/info`
           } catch (e) {

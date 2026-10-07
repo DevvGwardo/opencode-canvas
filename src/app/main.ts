@@ -502,6 +502,7 @@ async function boot() {
   try {
     await store.start()
   } catch (e) {
+    store.stop()
     if (!demo) return showUnavailable(root, { ...cfg, connected: false, error: (e as Error).message })
     throw e
   }

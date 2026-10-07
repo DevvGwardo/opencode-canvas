@@ -31,6 +31,7 @@ const { server } = await startServer({
   server: `http://127.0.0.1:${fake.port}`,
   password: "secret",
   autostart: false,
+  quiet: true,
 })
 const base = `http://127.0.0.1:${server.port}`
 

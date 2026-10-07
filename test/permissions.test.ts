@@ -87,4 +87,22 @@ describe("permissions", () => {
     await store.setSessionAutoApprove("a", false)
     expect(patches.at(-1)).toEqual(["a", null])
   })
+
+  test("a reload clears asks answered elsewhere while disconnected", async () => {
+    const { store, req, ask } = setup()
+    ask(req("per_1", "a"))
+    expect(store.status("a")).toBe("needs-you")
+    // Nothing is running any more and the server has no pending asks.
+    Object.assign(store.backend, {
+      listProjects: async () => [],
+      listSessions: async () => [...store.sessions.values()],
+      active: async () => new Set<string>(),
+      permissions: async () => [],
+      forms: async () => [],
+    })
+    await store.reload()
+    await tick()
+    expect(store.pendingPermissionCount()).toBe(0)
+    expect(store.status("a")).not.toBe("needs-you")
+  })
 })
