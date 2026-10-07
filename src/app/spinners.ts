@@ -15,7 +15,8 @@ export function setSpinnerStyle(s: SpinnerStyle) {
   style = s
 }
 
-export function spinner(size = 14, extraClass = ""): HTMLCanvasElement {
+/** A spinner canvas; `fixed` pins it to one style (the dock's previews). */
+export function spinner(size = 14, extraClass = "", fixed?: SpinnerStyle): HTMLCanvasElement {
   const c = document.createElement("canvas")
   const dpr = Math.min(3, window.devicePixelRatio || 1)
   c.width = Math.round(size * dpr * 1.5) // headroom for zoomed-in canvases
@@ -23,6 +24,7 @@ export function spinner(size = 14, extraClass = ""): HTMLCanvasElement {
   c.style.width = c.style.height = `${size}px`
   c.className = `spin ${extraClass}`.trim()
   c.setAttribute("aria-hidden", "true")
+  if (fixed) c.dataset.style = fixed
   live.add(c)
   if (!running) {
     running = true
@@ -144,6 +146,6 @@ function loop(now: number) {
     const s = c.width
     g.setTransform(1, 0, 0, 1, 0, 0)
     g.clearRect(0, 0, s, s)
-    draw[style](g, t, s)
+    draw[(c.dataset.style as SpinnerStyle | undefined) ?? style](g, t, s)
   }
 }

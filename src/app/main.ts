@@ -8,7 +8,7 @@ import { SessionPanel } from "./panel"
 import { NewSessionPicker } from "./picker"
 import { TilesView } from "./tiles"
 import { autoApproveToggle, autoApprovedNotices } from "./approve"
-import { SPINNERS, setSpinnerStyle, type SpinnerStyle } from "./spinners"
+import { SPINNERS, setSpinnerStyle, spinner, type SpinnerStyle } from "./spinners"
 import { ALLOW_ALL, STATUS_LABEL, Store, type Status } from "./store"
 import { toast } from "./toast"
 
@@ -279,6 +279,14 @@ async function boot() {
   const dock = el("div", "dock")
   const layoutSeg = segmented(LAYOUTS, LAYOUT_LABEL, layoutName, (v) => setLayout(v), "Layout")
   const spinSeg = segmented(SPINNERS, SPINNER_LABEL, spinnerStyle, (v) => setSpinner(v), "Spinner")
+  // The spinner only shows on working cards, often tiny or off screen, so each
+  // button previews its own animation.
+  layoutSeg.group.title = "How sessions are arranged on the canvas (1–4)"
+  spinSeg.group.title = "Animation shown on working sessions"
+  spinSeg.group.querySelectorAll<HTMLButtonElement>(".seg-btn").forEach((b, i) => {
+    b.prepend(spinner(12, "seg-spin", SPINNERS[i]))
+    b.classList.add("with-spin")
+  })
   dock.append(layoutSeg.group, el("span", "dock-sep"), spinSeg.group)
   root.append(top, dock)
 

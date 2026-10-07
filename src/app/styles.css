@@ -943,6 +943,23 @@ button {
   color: #fff;
 }
 
+.seg-btn.with-spin {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding-left: 9px;
+}
+
+.seg-btn .seg-spin {
+  opacity: 0.55;
+  transition: opacity 0.15s;
+}
+
+.seg-btn.on .seg-spin,
+.seg-btn:hover .seg-spin {
+  opacity: 1;
+}
+
 .dock-sep {
   width: 1px;
   height: 16px;
