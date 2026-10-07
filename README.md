@@ -1,5 +1,9 @@
 <p align="center">
-  <img src="assets/banner.jpg" alt="OpenCode Canvas banner" width="100%" />
+  <img src="assets/banner.jpg?v=2" alt="OpenCode Canvas banner" width="100%" />
+</p>
+
+<p align="center">
+  <img src="assets/logo.jpg?v=2" alt="OpenCode Canvas logo" width="120" />
 </p>
 
 <p align="center">
