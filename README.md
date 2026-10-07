@@ -48,6 +48,13 @@ OpenCode Canvas is a local web application that displays every OpenCode v2 codin
 - **Session creation**: Start new sessions from the global picker (`N`) with path autocompletion and model selection, or use the "+ New session" card at the end of each project.
 
 ### Status at a glance
+
+<p align="center">
+  <img src="assets/diagram-status-lifecycle.jpg" alt="Agent Session State and Attention Lifecycle" width="100%" />
+  <br />
+  <em>Agent session state & attention lifecycle: clear visual cues from Needs You to Done.</em>
+</p>
+
 - **Edge color indicator**: A 3-pixel status line along the top card edge remains visible at all zoom levels, reinforced by border color and background tint.
 - **Clear status hierarchy**:
   - **Needs you** (amber): Waiting for a permission prompt or input question; card pulses.
@@ -148,6 +155,12 @@ You can also append `?demo=1` to the URL at any time.
 
 ### Layouts
 
+<p align="center">
+  <img src="assets/diagram-layouts.jpg" alt="OpenCode Canvas Dynamic Spatial Layouts" width="100%" />
+  <br />
+  <em>The four spatial layout paradigms: Satellites, Fold, Tabs, and Tree.</em>
+</p>
+
 Select layouts using keys `1`–`4` or the layout switcher in the dock:
 
 - **Satellites** (`1`): Projects are hubs centered on their latest session, with other sessions orbiting in concentric rings. Sessions with subagents carry a small orbit.
@@ -200,6 +213,12 @@ CLI arguments supported by `opencode-canvas`:
 | `--no-autostart` | `false` | Opt out of automatically starting the OpenCode background service (`opencode service start`) if stopped. |
 
 ## How it works
+
+<p align="center">
+  <img src="assets/diagram-architecture.jpg" alt="OpenCode Canvas Architecture and Data Flow" width="100%" />
+  <br />
+  <em>End-to-end architecture: Browser Canvas client, local Bun proxy, and OpenCode v2 daemon.</em>
+</p>
 
 ```
 browser ──/api/*──▶ opencode-canvas (Bun) ──Basic auth──▶ OpenCode v2 service
