@@ -49,6 +49,14 @@ async function run(bin: string, args: string[], timeoutMs = 20_000) {
 
 const URL_RE = /https?:\/\/[^\s]+/
 
+export function upstreamUrl(value: string) {
+  const url = new URL(value)
+  if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
+    throw new Error("OpenCode server must be an HTTP(S) URL without embedded credentials, a query, or a fragment.")
+  }
+  return url.toString().replace(/\/+$/, "")
+}
+
 async function serviceUrl(bin: string, autostart: boolean): Promise<string | undefined> {
   let status = await run(bin, ["service", "status"])
   let match = status.out.match(URL_RE)
@@ -69,7 +77,7 @@ export async function resolveUpstream(opts: UpstreamOptions = {}): Promise<Upstr
   const username = opts.username ?? process.env.OPENCODE_SERVER_USERNAME ?? "opencode"
   if (explicit) {
     return {
-      url: explicit.replace(/\/+$/, ""),
+      url: upstreamUrl(explicit),
       username,
       password: opts.password ?? process.env.OPENCODE_SERVER_PASSWORD,
       source: "explicit",
@@ -79,7 +87,7 @@ export async function resolveUpstream(opts: UpstreamOptions = {}): Promise<Upstr
   const url = await serviceUrl(bin, opts.autostart ?? true)
   if (!url) throw new Error("OpenCode background service is not running and could not be started (`opencode service start`).")
   return {
-    url: url.replace(/\/+$/, ""),
+    url: upstreamUrl(url),
     username,
     password: opts.password ?? process.env.OPENCODE_SERVER_PASSWORD ?? (await readServicePassword()),
     source: "service",

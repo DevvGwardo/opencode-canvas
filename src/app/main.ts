@@ -1,8 +1,10 @@
 import type { ModelRef } from "./types"
 import { LiveBackend, type Backend, type ConnectionState } from "./backend"
+import { BrowserPanel } from "./browser"
 import { CanvasView } from "./canvas"
 import { DemoBackend } from "./demo"
 import { LAYOUTS, type LayoutName } from "./layouts"
+import { ensureAccess } from "./login"
 import { defaultModel } from "./models"
 import { SessionPanel } from "./panel"
 import { NewSessionPicker } from "./picker"
@@ -113,6 +115,7 @@ function showUnavailable(root: HTMLElement, cfg: CanvasConfig) {
 
 async function boot() {
   const root = document.getElementById("app")!
+  const protectedAccess = await ensureAccess(root)
   const params = new URLSearchParams(location.search)
   const cfg = await getConfig()
   const demo = params.has("demo") || cfg.mode === "demo"
@@ -123,6 +126,11 @@ async function boot() {
 
   root.replaceChildren()
   root.classList.add("ready")
+  let browserBtn: HTMLButtonElement
+  const browser = new BrowserPanel(root, () => {
+    browserBtn?.classList.toggle("on", browser.isOpen)
+    window.dispatchEvent(new Event("resize"))
+  })
 
   let layoutName = pref.get<LayoutName>("layout", "tree", LAYOUTS)
   let spinnerStyle = pref.get<SpinnerStyle>("spinner", "comet", SPINNERS)
@@ -137,12 +145,12 @@ async function boot() {
   canvas.setLayout(layoutName)
   root.dataset.layout = layoutName
   // Handy from the devtools console.
-  ;(window as any).opencodeCanvas = { canvas, store }
+  ;(window as any).opencodeCanvas = { canvas, store, browser }
 
   panel = new SessionPanel(root, store, backend, canvas, () => {
     root.classList.remove("panel-open")
     if (location.hash) history.replaceState(null, "", location.pathname + location.search)
-  })
+  }, (url) => browser.open(url))
 
   function openSession(id: string) {
     const from = canvas.cardRect(id)
@@ -171,7 +179,12 @@ async function boot() {
   }
 
   const tiles = new TilesView(root, store, backend, {
-    openOnCanvas: (id) => requestAnimationFrame(() => openSession(id)),
+    openOnCanvas: (id, control) => requestAnimationFrame(() => {
+      openSession(id)
+      if (control === "model") void panel.showModelPicker()
+      if (control === "effort") void panel.showEffortPicker()
+    }),
+    openBrowser: (url) => browser.open(url),
     newSession: () => openPicker(),
     closed: () => {
       updateStats()
@@ -264,6 +277,13 @@ async function boot() {
   tilesBtn.title = "Every running session's chat, side by side (T)"
   tilesBtn.addEventListener("click", () => (tiles.isOpen ? tiles.close() : openTiles()))
   right.append(autoApproveToggle(store), tilesBtn)
+  browserBtn = el("button", "tiles-open-btn", "Browser") as HTMLButtonElement
+  browserBtn.classList.add("browser-open-btn")
+  browserBtn.innerHTML = `<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" aria-hidden="true"><rect x="1.5" y="2" width="13" height="12" rx="2"/><path d="M1.5 5.5h13M4 3.7h.1M6 3.7h.1"/></svg><span class="browser-label">Browser</span>`
+  browserBtn.setAttribute("aria-label", "Browser")
+  browserBtn.title = "Interactive host browser (B)"
+  browserBtn.addEventListener("click", () => browser.isOpen ? browser.close() : browser.open())
+  right.append(browserBtn)
   autoApprovedNotices(store)
   const newBtn = el("button", "new-btn") as HTMLButtonElement
   newBtn.innerHTML = `<span class="plus">+</span><span class="new-label">New session</span>`
@@ -274,6 +294,15 @@ async function boot() {
   help.setAttribute("aria-label", "Keyboard shortcuts")
   help.addEventListener("click", () => toggleHelp())
   right.append(help)
+  if (protectedAccess) {
+    const signOut = el("button", "tiles-open-btn sign-out", "Sign out") as HTMLButtonElement
+    signOut.addEventListener("click", async () => {
+      const res = await fetch("/canvas/auth", { method: "DELETE" })
+      if (res.ok) location.reload()
+      else toast("Couldn't sign out. Try again.")
+    })
+    right.append(signOut)
+  }
   top.append(brand, search, right)
 
   const dock = el("div", "dock")
@@ -386,6 +415,7 @@ async function boot() {
         <dt>0 · double-click</dt><dd>Fit everything</dd>
         <dt>N</dt><dd>New session: pick a project or type a folder path</dd>
         <dt>T</dt><dd>Tiles: every running session's chat side by side</dd>
+        <dt>B</dt><dd>Open the integrated Chrome/Chromium browser</dd>
         <dt>] · [</dt><dd>Next / previous session that needs you, then to review, then working</dd>
       </dl>
       <h2>Status</h2>
@@ -403,6 +433,9 @@ async function boot() {
         <dt>Tab</dt><dd>Queue for after the current turn</dd>
         <dt>⇧ Enter</dt><dd>New line</dd>
         <dt>⌘ .</dt><dd>Stop</dd>
+        <dt>/help</dt><dd>Slash commands, including project-specific OpenCode commands</dd>
+        <dt>/effort high</dt><dd>Change model effort (/effort opens the picker)</dd>
+        <dt>/browser URL</dt><dd>Browse a URL on the host computer</dd>
       </dl>`
     helpEl.addEventListener("click", () => toggleHelp())
     root.append(helpEl)
@@ -433,6 +466,7 @@ async function boot() {
     if (e.key === "Escape") {
       if (helpEl) return toggleHelp()
       if (picker.isOpen) return picker.close()
+      if (browser.isOpen) return browser.close()
       if (panel.isOpen) return panel.close()
       if (tiles.isOpen) {
         if (tiles.maximized) return tiles.toggleMax(tiles.maximized)
@@ -446,6 +480,10 @@ async function boot() {
       if (canvas.filter) return setFilter(undefined)
       if (canvas.closeStack()) return
       return canvas.select(undefined)
+    }
+    if ((e.key === "b" || e.key === "B") && !e.metaKey && !e.ctrlKey && !e.altKey) {
+      e.preventDefault()
+      return browser.isOpen ? browser.close() : browser.open()
     }
     if (panel.isOpen) {
       if (e.key.length === 1 && !e.metaKey && !e.ctrlKey && !e.altKey) panel.focusInput()
@@ -519,6 +557,10 @@ async function boot() {
   const hash = location.hash.slice(1)
   if (hash === "tiles") openTiles()
   if (hash && store.sessions.has(hash)) requestAnimationFrame(() => requestAnimationFrame(() => openSession(hash)))
+  window.addEventListener("pagehide", () => { store.stop(); browser.close() })
+  window.addEventListener("pageshow", (event) => { if (event.persisted) location.reload() })
 }
 
-void boot()
+void boot().catch((e) => {
+  showUnavailable(document.getElementById("app")!, { mode: "live", connected: false, error: (e as Error).message })
+})

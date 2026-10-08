@@ -139,7 +139,10 @@ export class Store {
           cur.time.viewed !== fresh.time.viewed ||
           cur.time.idle !== fresh.time.idle ||
           cur.outcome !== fresh.outcome ||
-          cur.title !== fresh.title
+          cur.title !== fresh.title ||
+          cur.model?.id !== fresh.model?.id ||
+          cur.model?.providerID !== fresh.model?.providerID ||
+          cur.model?.variant !== fresh.model?.variant
         if (changed) {
           if (cur.title !== fresh.title) structure = true
           this.sessions.set(fresh.id, { ...fresh, time: { ...fresh.time, viewed: Math.max(fresh.time.viewed ?? 0, cur.time.viewed ?? 0) || undefined } })

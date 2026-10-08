@@ -81,7 +81,17 @@ OpenCode Canvas is a local web application that displays every OpenCode v2 codin
 - **Inline interaction**: Authorize permissions, answer questions, and submit forms without switching contexts.
 - **Rich input**: Paste or drag-and-drop images directly into the composer.
 - **Model switching**: Switch models dynamically across all providers configured in OpenCode; chosen models persist for new sessions.
+- **Model effort**: Select the actual effort variants advertised by OpenCode (such as low, high, or max), independently of the model. The selection persists for new sessions.
+- **Slash commands**: Discover project-specific OpenCode commands and Canvas controls in both session and tile composers.
+- **Draft retention**: Unsent session and tile drafts survive closing and reopening their views. Failed sends restore the message and attachments when the composer is still empty, without overwriting a newer draft.
 - **Session controls**: Stop a running agent from the header (or `Command+.`). The `...` menu copies the resume command (`opencode -s <id>`) or session ID, renames the session, toggles auto-approve, and pins it to Tiles.
+
+### Browser and local network
+- **Real Chromium browser**: Browse inside Canvas with live viewport streaming, tabs, back/forward, reload, mouse input, keyboard input, and touch scrolling. Sites that reject iframe embedding still work.
+- **Host-local previews**: Open `http://localhost:3000` to see an application running on the Canvas host, even when accessing Canvas from a phone or another computer.
+- **Phone/desktop layouts**: Switch the remote viewport between narrow and desktop layouts. A new browser starts in phone layout on small screens.
+- **Isolated profile**: Chrome runs on demand in a temporary profile, never your personal Chrome profile. Streaming pauses when hidden; the browser closes after five minutes without viewers.
+- **Authenticated LAN access**: `--lan` requires a separate Canvas password, prints local-network URLs, and keeps OpenCode credentials on the host.
 
 ### Permissions
 - **Granular and batch controls**: Authorize individual prompts, set session-wide exemptions, or clear all pending requests at once.
@@ -120,6 +130,26 @@ opencode-canvas --open
 
 The interface opens at `http://127.0.0.1:4317`. If your OpenCode background service is stopped, OpenCode Canvas automatically launches it via `opencode service start` (pass `--no-autostart` to disable).
 
+### Access from your local network
+
+Set a separate Canvas password (at least 12 characters), then enable LAN access:
+
+```sh
+printf 'Canvas password (12+ characters): '
+read -r -s CANVAS_PASSWORD
+printf '\n'
+export CANVAS_PASSWORD
+opencode-canvas --lan --open
+```
+
+Open one of the printed `network` URLs on another device and sign in. OpenCode itself can stay bound to loopback. To use a custom local hostname, add `--allow-host my-computer.local`; repeat the flag for additional names.
+
+Canvas logins expire after 12 hours or a server restart. **Sign out** revokes that login. Setting `CANVAS_PASSWORD` also enables login for loopback-only use.
+
+Authentication is not encryption. Use plain HTTP only on a trusted private network. For untrusted networks or remote access, use HTTPS or a private VPN. Do not port-forward Canvas to the public internet, and do not expose development mode to untrusted clients.
+
+For a trusted HTTPS reverse proxy, keep Canvas on loopback and set `--origin https://canvas.lan`. This allows only that exact browser-facing origin and sets Secure login cookies. Configure the proxy to forward to `http://127.0.0.1:4317` without buffering SSE. Canvas does not trust arbitrary forwarded-host/protocol headers or configure TLS certificates for you.
+
 ### Demo mode
 
 Run simulated sessions with synthetic streaming data, without requiring a running OpenCode service:
@@ -148,10 +178,38 @@ You can also append `?demo=1` to the URL at any time.
 | `/` or `Command+K` or type | Focus global search |
 | `N` | Open new session picker (preselects focused card's project) |
 | `T` | Toggle Tiles view |
+| `B` | Toggle the integrated browser (outside a text input) |
 | `1` – `4` | Switch layout (`1` Satellites, `2` Fold, `3` Tabs, `4` Tree) |
 | `]` / `[` | Jump to next / previous session needing attention |
 | `Command+.` | Stop running agent |
 | `?` | Toggle keyboard shortcuts overlay |
+
+### Model effort and slash commands
+
+The new-session picker has an effort selector next to the model. Existing sessions have an effort button in the header. Only variants configured for that model appear; **Default effort** leaves the choice to OpenCode. When switching models, Canvas preserves an effort only if the new model supports it. Changes affect subsequent model turns, not an already-running provider request.
+
+Type `/` in either composer, or click its `/` button. Arrow keys select a command; `Tab` completes it. `Enter` completes a partial command or runs a fully typed command. Commands registered by OpenCode are loaded for the session's project and executed through the native command API, with arguments, attachments, and queue/steer delivery preserved.
+
+| Command | Action |
+|---|---|
+| `/help` | Open the command picker |
+| `/model` | Open model selection |
+| `/effort` / `/effort high` | Open effort selection or choose a supported variant |
+| `/effort default` | Restore OpenCode's configured effort |
+| `/compact` | Compact session context using OpenCode's native API |
+| `/stop` | Interrupt the current session |
+| `/browser` / `/browser http://localhost:3000` | Open the integrated browser, optionally at a URL |
+| `/init`, `/review`, custom commands | Execute commands registered in the current project |
+
+Canvas controls take precedence over identically named project commands. TUI-only commands that aren't exposed by OpenCode's command registry or listed above aren't emulated.
+
+### Integrated browser
+
+Install Chrome or Chromium on the machine running Canvas. Canvas discovers common installations automatically; otherwise pass `--browser-bin /absolute/path/to/chromium` or set `CANVAS_BROWSER_BIN`. No browser automation dependency is required.
+
+Open **Browser** from the top bar, session header, or Tiles toolbar. Enter a URL, then click directly on the live page. Use the keyboard or paste text while the viewport is focused. On touch devices, tap a page field and use the bottom **Type** input and **Enter** button. Swipe the viewport to scroll. **Phone layout** / **Desktop layout** changes the remote viewport; **Expand** makes the panel full-size.
+
+There is one shared browser per Canvas server, with up to four viewers. Everyone with Canvas access can see and control its tabs, including any site logins made there. The temporary profile is discarded after five minutes without viewers or when Canvas stops. Downloads are blocked; file uploads, remote clipboard copying, audio, and browser extensions aren't supported. Use `--no-browser` to disable this feature.
 
 ### Layouts
 
@@ -203,7 +261,12 @@ CLI arguments supported by `opencode-canvas`:
 | Flag | Default | Description |
 |---|---|---|
 | `-p, --port <port>` | `4317` | Port to listen on. Pass `0` to pick a random available port. |
-| `--hostname <host>` | `127.0.0.1` | Network interface to bind. Binding to non-loopback addresses exposes OpenCode to your network. |
+| `--hostname <host>` | `127.0.0.1` | Network interface to bind. Non-loopback bindings require `CANVAS_PASSWORD`. |
+| `--lan` | `false` | Bind to `0.0.0.0` for authenticated local-network access. |
+| `--allow-host <host>` | Local interface addresses | Allow a custom LAN hostname in addition to loopback and local IPs. Repeatable. |
+| `--origin <url>` | Unset | Exact public HTTP(S) origin for a trusted reverse proxy; requires `CANVAS_PASSWORD`. HTTPS enables Secure login cookies. |
+| `--browser-bin <path>` | Auto-detected | Absolute Chrome/Chromium executable path; also configurable with `CANVAS_BROWSER_BIN`. |
+| `--no-browser` | `false` | Disable the integrated browser. |
 | `--server <url>` | Background service | Target OpenCode server URL (e.g. `http://127.0.0.1:4096`). Discovered via `opencode service status` if omitted. |
 | `--password <password>` | `service.json` | Server authentication password. Alternatively set `OPENCODE_SERVER_PASSWORD`. |
 | `--username <username>` | `opencode` | Server authentication username. Alternatively set `OPENCODE_SERVER_USERNAME`. |
@@ -211,6 +274,8 @@ CLI arguments supported by `opencode-canvas`:
 | `--dev` | `false` | Enable hot-reloading for UI development. |
 | `--open` | `false` | Automatically open the canvas in your default browser on startup. |
 | `--no-autostart` | `false` | Opt out of automatically starting the OpenCode background service (`opencode service start`) if stopped. |
+
+`CANVAS_PASSWORD` protects Canvas itself and is separate from `OPENCODE_SERVER_PASSWORD`, which authenticates Canvas to OpenCode. Server URLs must use HTTP(S) without embedded credentials.
 
 ## How it works
 
@@ -225,7 +290,8 @@ browser ──/api/*──▶ opencode-canvas (Bun) ──Basic auth──▶ Op
         ◀──SSE────                        ◀──/api/event──
 ```
 
-- **Server** (`src/server/`): Locates the service URL with `opencode service status`, loads the password from `~/.config/opencode/service.json`, and reverse-proxies `/api/*` endpoints with Basic authentication attached. The browser never receives the password. Server-Sent Events (SSE) stream unbuffered. If the service restarts on a new port, it is rediscovered automatically on the next failed request. Enforces CSRF and origin security: requests with a foreign `Origin`, a cross-site `Sec-Fetch-Site`, or a non-loopback `Host` receive a 403 Forbidden response.
+- **Server** (`src/server/`): Locates the service URL with `opencode service status`, loads the password from `~/.config/opencode/service.json`, and reverse-proxies `/api/*` endpoints with Basic authentication attached. The browser never receives the password; model settings, headers, and variant bodies are stripped from model metadata responses. SSE streams without buffering. Failed reads rediscover the service once; writes are never automatically retried because they may already have been accepted. Foreign origins, cross-site requests, and unapproved hosts receive 403. LAN access additionally requires a rate-limited password login with an HttpOnly, SameSite cookie; revoked logins lose access to existing streams.
+- **Browser** (`src/server/browser.ts`, `src/app/browser.ts`): Launches sandboxed Chrome/Chromium with a temporary profile and loopback-only debugging. JPEG viewport frames stream over authenticated SSE with frame throttling and backpressure; validated navigation/input actions travel through Canvas, never through an exposed debugging port. Hidden panels stop streaming, and an idle browser is shut down automatically.
 - **Store** (`src/app/store.ts`): Loads the most recent 600 sessions, active sessions (`/api/session/active`), and project lists on boot. Tracks real-time updates through `/api/event` (`session.execution.*`, `session.text.delta`, `session.tool.*`, `session.inbox.*`, `permission.*`, `form.*`). Card previews load lazily for visible cards (4 at a time). Full state resynchronizes automatically after reconnecting.
 - **Canvas** (`src/app/canvas.ts`, `camera.ts`, `layouts.ts`): Renders DOM cards inside a transformed world layer. Layouts are computed as pure functions, movements follow critically damped springs, off-screen cards are culled, and text re-rasterizes sharply once camera motion settles.
 - **Transcript** (`src/app/transcript.ts`): Shared by the open-session panel (`panel.ts`) and every tile (`tiles.ts`). Applies streaming events directly to the transcript (reasoning deltas, text deltas, tool lifecycle phases) and reconciles with `GET /message` after each step.
@@ -237,6 +303,8 @@ browser ──/api/*──▶ opencode-canvas (Bun) ──Basic auth──▶ Op
 - `session.create`
 - `session.update` (title, permissions)
 - `session.prompt`
+- `session.command`
+- `session.compact`
 - `session.interrupt`
 - `session.switchModel`
 - `session.view`
@@ -253,6 +321,7 @@ browser ──/api/*──▶ opencode-canvas (Bun) ──Basic auth──▶ Op
 - `project.list`
 - `model.list`
 - `model.default`
+- `command.list` (project-specific slash command discovery)
 - `fs.list` (folder autocomplete in the new session picker)
 - `event.subscribe`
 
@@ -262,9 +331,11 @@ The complete API specification is available at `GET /openapi.json` on your OpenC
 
 OpenCode Canvas is a local proxy for your OpenCode server, which has permission to read and write files and execute shell commands on your system.
 
-- Listens on `127.0.0.1` by default. Binding to an external interface (`--hostname`) exposes your OpenCode server to that network.
-- Server credentials remain on the server and are never exposed to client-side code.
-- Foreign `Origin`, cross-site `Sec-Fetch-Site`, and non-loopback `Host` headers are rejected to prevent malicious websites from interacting with your agents.
+- Listens on `127.0.0.1` by default. LAN access requires a separate password of at least 12 characters, using `CANVAS_PASSWORD`.
+- Server credentials and provider model settings remain on the server. Browser actions and streams require the same Canvas login as the OpenCode API.
+- Foreign `Origin`, cross-site `Sec-Fetch-Site`, and unapproved `Host` headers are rejected. Local interface IPs and explicitly allowed hostnames work without removing these checks.
+- Plain HTTP does not encrypt passwords, transcripts, or browser frames. Use HTTPS/VPN outside a trusted private network.
+- The integrated browser is shared with every authenticated Canvas user, not isolated per user. It uses a temporary profile rather than your personal browser state.
 - Auto-approve permissions allow agents to execute commands without user confirmation and require deliberate activation.
 
 For vulnerability reporting guidelines, please refer to [SECURITY.md](SECURITY.md).

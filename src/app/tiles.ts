@@ -4,7 +4,9 @@
 // session can be pinned.
 
 import type { Backend } from "./backend"
+import { CANVAS_COMMANDS, parseCommand, runCanvasCommand, sendPrompt, SlashCommands } from "./commands"
 import { timeAgo } from "./format"
+import { effortLabel, modelLabel, setSessionEffort } from "./models"
 import { spinner } from "./spinners"
 import { REVIEW_WINDOW, type Status, type Store } from "./store"
 import { toast } from "./toast"
@@ -88,6 +90,9 @@ class Tile {
   private maxBtn: HTMLButtonElement
   private input: HTMLTextAreaElement
   private hint: HTMLElement
+  private slash: SlashCommands
+  private modelBtn: HTMLButtonElement
+  private sendBtn: HTMLButtonElement
   private state = ""
 
   constructor(
@@ -112,7 +117,8 @@ class Tile {
     actions.append(this.pinBtn, this.maxBtn, open, close)
     row.append(this.projectEl, this.statusEl, this.stopBtn, actions)
     this.titleEl = h("div", "tile-title")
-    head.append(row, this.titleEl)
+    this.modelBtn = this.button("", "Choose model and effort", () => this.view.openOnCanvas(id, "model"), "tile-model")
+    head.append(row, this.titleEl, this.modelBtn)
     head.addEventListener("dblclick", (e) => {
       if (!(e.target as HTMLElement).closest("button")) this.view.toggleMax(id)
     })
@@ -128,8 +134,15 @@ class Tile {
     const composer = h("div", "tile-composer")
     this.input = h("textarea", "tile-input") as HTMLTextAreaElement
     this.input.rows = 1
+    this.input.setAttribute("aria-label", "Tile message")
     this.hint = h("span", "tile-hint")
-    composer.append(this.input, this.hint)
+    const commands = this.button("/", "Show slash commands", () => this.slash.open())
+    this.sendBtn = this.button("Send", "Send message", () => void this.send(this.store.running.has(id) ? "steer" : undefined), "composer-send")
+    composer.append(commands, this.input, this.hint, this.sendBtn)
+    this.slash = new SlashCommands(this.input, composer, backend)
+    const directory = store.sessions.get(id)?.location.directory
+    if (directory) this.slash.setDirectory(directory)
+    this.input.value = this.view.drafts.get(id) ?? ""
     this.bindComposer()
 
     this.root.append(head, this.transcript.scroller, composer)
@@ -160,6 +173,7 @@ class Tile {
     this.root.style.setProperty("--project-hue", String(projectHue(this.store.groupKey(parent ?? s))))
     this.titleEl.textContent = parent ? `${this.store.title(parent)} ▸ ${this.store.title(s)}` : this.store.title(s)
     this.titleEl.title = this.titleEl.textContent
+    this.modelBtn.textContent = `${modelLabel(s.model)} · ${effortLabel(s.model?.variant)}`
 
     const status = this.view.statusOf(this.id)
     const ask = this.store.needsInput(this.id)
@@ -201,6 +215,7 @@ class Tile {
     }
     this.input.placeholder = working ? "Steer…" : "Reply…"
     this.hint.textContent = working ? "Tab to queue" : ""
+    this.sendBtn.textContent = working ? "Steer" : "Send"
   }
 
   private bindComposer() {
@@ -212,6 +227,7 @@ class Tile {
     input.addEventListener("keydown", (e) => {
       e.stopPropagation()
       if (e.isComposing) return
+      if (this.slash.onKey(e)) return
       const running = this.store.running.has(this.id)
       if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault()
@@ -227,18 +243,48 @@ class Tile {
   }
 
   private async send(delivery: "steer" | "queue" | undefined) {
+    const draft = this.input.value
     const text = this.input.value.trim()
     if (!text) return
+    const command = parseCommand(text)
+    if (command && CANVAS_COMMANDS.some((c) => c.name === command.name)) {
+      try {
+        await runCanvasCommand(text, {
+          help: () => this.slash.open(),
+          model: () => this.view.openOnCanvas(this.id, "model"),
+          effort: async (variant) => {
+            if (!variant) return this.view.openOnCanvas(this.id, "effort")
+            const session = this.store.sessions.get(this.id)
+            if (!session) return
+            await setSessionEffort(this.backend, session, variant)
+            const current = this.store.sessions.get(this.id)
+            if (current) current.model = session.model
+            this.store.touchCard(this.id)
+          },
+          compact: async () => { await this.backend.compact(this.id, delivery); this.transcript.scheduleRefetch(80) },
+          stop: () => this.backend.interrupt(this.id),
+          browser: (url) => this.view.openBrowser(url),
+        })
+        if (command.name !== "help" && this.input.value === draft) this.input.value = ""
+        if (command.name !== "help") this.view.drafts.delete(this.id)
+      } catch (e) {
+        toast((e as Error).message)
+      }
+      return
+    }
     this.input.value = ""
+    this.view.drafts.delete(this.id)
     this.input.style.height = "auto"
-    const temp: InboxItem = { id: `local_${Date.now()}`, sessionID: this.id, type: "user", payload: { text }, delivery: delivery ?? "steer" }
+    this.slash.close()
+    const temp: InboxItem = { id: `local_${Date.now()}_${Math.random().toString(36).slice(2)}`, sessionID: this.id, type: "user", payload: { text }, delivery: delivery ?? "steer" }
     this.transcript.addPending(temp)
     try {
-      await this.backend.prompt(this.id, { text, delivery })
+      await sendPrompt(this.backend, this.id, text, delivery)
       this.transcript.scheduleRefetch(80)
     } catch (e) {
       this.transcript.removePending(temp)
-      this.input.value = text
+      if (!this.input.value) this.input.value = draft
+      if (!this.root.isConnected && !this.view.drafts.get(this.id)) this.view.drafts.set(this.id, draft)
       toast(`Couldn't send: ${(e as Error).message}`)
     }
   }
@@ -248,6 +294,9 @@ class Tile {
   }
 
   destroy() {
+    if (this.input.value) this.view.drafts.set(this.id, this.input.value)
+    else this.view.drafts.delete(this.id)
+    this.slash.close()
     this.transcript.destroy()
     this.root.remove()
   }
@@ -255,6 +304,7 @@ class Tile {
 
 export class TilesView {
   readonly el: HTMLElement
+  readonly drafts = new Map<string, string>()
   private grid: HTMLElement
   private countsEl: HTMLElement
   private empty: HTMLElement
@@ -274,7 +324,7 @@ export class TilesView {
     host: HTMLElement,
     private store: Store,
     private backend: Backend,
-    private handlers: { openOnCanvas(id: string): void; newSession(): void; closed(): void },
+    private handlers: { openOnCanvas(id: string, control?: "model" | "effort"): void; openBrowser(url?: string): void; newSession(): void; closed(): void },
   ) {
     this.el = h("section", "tiles-view")
     this.el.setAttribute("aria-label", "Tiled sessions")
@@ -299,7 +349,9 @@ export class TilesView {
     const back = h("button", "tiles-btn primary", "Canvas") as HTMLButtonElement
     back.title = "Back to the canvas (Esc)"
     back.addEventListener("click", () => this.close())
-    tools.append(subs, autoApproveToggle(store), newBtn, back)
+    const browser = h("button", "tiles-btn", "Browser") as HTMLButtonElement
+    browser.addEventListener("click", () => this.handlers.openBrowser())
+    tools.append(subs, autoApproveToggle(store), browser, newBtn, back)
     bar.append(title, tools)
 
     this.grid = h("div", "tiles-grid")
@@ -422,9 +474,13 @@ export class TilesView {
     if (this.maximized) this.tiles.get(id)?.focus()
   }
 
-  openOnCanvas(id: string) {
+  openOnCanvas(id: string, control?: "model" | "effort") {
     this.close()
-    this.handlers.openOnCanvas(id)
+    this.handlers.openOnCanvas(id, control)
+  }
+
+  openBrowser(url?: string) {
+    this.handlers.openBrowser(url)
   }
 
   // ---- rendering -------------------------------------------------------------------

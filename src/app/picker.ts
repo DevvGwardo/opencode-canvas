@@ -3,7 +3,7 @@
 
 import type { Backend, ModelOption } from "./backend"
 import { basename, timeAgo } from "./format"
-import { defaultModel, models, serverDefault, setDefaultModel } from "./models"
+import { defaultModel, effortLabel, modelRef, models, serverDefault, setDefaultModel } from "./models"
 import type { Store } from "./store"
 import type { ModelRef } from "./types"
 
@@ -40,11 +40,12 @@ export class NewSessionPicker {
   private list!: HTMLElement
   private foot!: HTMLElement
   private modelBtn!: HTMLButtonElement
+  private effort!: HTMLSelectElement
   private autoBox!: HTMLInputElement
   private options: Option[] = []
   private active = 0
   private seq = 0
-  private folderCache = new Map<string, Promise<string[]>>()
+  private folderCache = new Map<string, Promise<string[] | undefined>>()
   private mode: "where" | "model" = "where"
   private whereQuery = ""
   private preferred?: string
@@ -69,6 +70,7 @@ export class NewSessionPicker {
     this.model = defaultModel()
     this.mode = "where"
     this.whereQuery = ""
+    this.folderCache.clear()
 
     const scrim = h("div", "picker-scrim")
     scrim.addEventListener("pointerdown", () => this.close())
@@ -81,6 +83,9 @@ export class NewSessionPicker {
     this.modelBtn = h("button", "picker-model-btn") as HTMLButtonElement
     this.modelBtn.title = "Choose the model (Shift+Tab)"
     this.modelBtn.addEventListener("click", () => this.setMode(this.mode === "model" ? "where" : "model"))
+    this.effort = h("select", "effort-select") as HTMLSelectElement
+    this.effort.setAttribute("aria-label", "Model effort for new session")
+    this.effort.title = "Model effort, using the variants configured in OpenCode"
     const auto = h("label", "picker-auto")
     this.autoBox = h("input") as HTMLInputElement
     this.autoBox.type = "checkbox"
@@ -88,7 +93,7 @@ export class NewSessionPicker {
     auto.title = "Start the session with an allow-everything rule: it never stops to ask for permission"
     auto.append(this.autoBox, document.createTextNode(" Auto-approve"))
     const headRight = h("div", "picker-head-right")
-    headRight.append(auto, this.modelBtn)
+    headRight.append(auto, this.modelBtn, this.effort)
     head.append(h("span", "picker-title", "New session"), headRight)
 
     this.input = h("input", "picker-input") as HTMLInputElement
@@ -110,6 +115,7 @@ export class NewSessionPicker {
   }
 
   close() {
+    this.seq++
     this.el?.remove()
     this.el = undefined
   }
@@ -132,23 +138,42 @@ export class NewSessionPicker {
 
   private async renderModelButton() {
     const btn = this.modelBtn
+    const selected = this.model
+    const effort = this.effort
+    effort.disabled = true
     btn.replaceChildren(h("span", "pm-k", "Model"))
     let name: string
     let sub: string
-    if (this.model) {
+    let option: ModelOption | undefined
+    if (selected) {
       const all = await models(this.backend).catch(() => [] as ModelOption[])
-      const m = all.find((x) => keyOf(x) === keyOf(this.model))
-      name = m?.name ?? this.model.id
-      sub = this.model.providerID
+      const m = all.find((x) => keyOf(x) === keyOf(selected))
+      option = m
+      name = m?.name ?? selected.id
+      sub = selected.providerID
     } else {
       const d = await serverDefault(this.backend)
+      option = d
       name = d ? d.name : "OpenCode default"
       sub = d ? "OpenCode default" : ""
     }
-    if (btn !== this.modelBtn) return
+    if (btn !== this.modelBtn || selected !== this.model || !this.el) return
+    if (this.model?.variant && option && !option.variants?.includes(this.model.variant)) {
+      this.model = { id: this.model.id, providerID: this.model.providerID }
+      setDefaultModel(this.model)
+    }
     btn.append(h("span", "pm-v", name))
     if (sub) btn.append(h("span", "pm-s", sub))
     btn.append(h("span", "pm-caret", "▾"))
+    effort.replaceChildren(new Option("Default effort", ""), ...(option?.variants ?? []).map((v) => new Option(effortLabel(v), v)))
+    effort.value = this.model?.variant ?? ""
+    effort.disabled = !option?.variants?.length
+    // Choosing effort for OpenCode's default makes that model explicit.
+    effort.onchange = () => {
+      if (!option) return
+      this.model = { id: option.id, providerID: option.providerID, ...(effort.value ? { variant: effort.value } : {}) }
+      setDefaultModel(this.model)
+    }
   }
 
   // ---- where -------------------------------------------------------------------
@@ -165,7 +190,7 @@ export class NewSessionPicker {
   private folders(dir: string) {
     let p = this.folderCache.get(dir)
     if (!p) {
-      p = this.backend.listFolders(dir).catch(() => [])
+      p = this.backend.listFolders(dir).catch(() => undefined)
       this.folderCache.set(dir, p)
     }
     return p
@@ -207,7 +232,7 @@ export class NewSessionPicker {
       path.endsWith("/") ? this.folders(exact) : Promise.resolve(null),
     ])
     if (seq !== this.seq) return undefined
-    const exists = path.endsWith("/") ? (exactKids?.length ?? 0) > 0 || exact === "/" : kids.includes(path.slice(slash + 1))
+    const exists = path.endsWith("/") ? exactKids !== undefined || exact === "/" : !!kids?.includes(path.slice(slash + 1))
     const start: Option = {
       kind: "path",
       label: `Start in ${this.show(exact)}`,
@@ -216,7 +241,7 @@ export class NewSessionPicker {
     }
     const opts: Option[] = exists ? [start] : []
     const base = path.endsWith("/") ? exact : parent
-    const names = (path.endsWith("/") ? (exactKids ?? []) : kids.filter((k) => k.toLowerCase().startsWith(leaf) && k.toLowerCase() !== leaf))
+    const names = (path.endsWith("/") ? (exactKids ?? []) : (kids ?? []).filter((k) => k.toLowerCase().startsWith(leaf) && k.toLowerCase() !== leaf))
       .filter((k) => !k.startsWith(".") || leaf.startsWith("."))
       .slice(0, 40)
     for (const k of names) {
@@ -251,7 +276,7 @@ export class NewSessionPicker {
         kind: "model",
         label: m.name,
         sub: keyOf(m),
-        model: { id: m.id, providerID: m.providerID },
+        model: modelRef(m, this.model),
         current: keyOf(m) === current,
       })
     return out
@@ -326,7 +351,7 @@ export class NewSessionPicker {
     if (o.kind !== "project" && o.directory !== "/") {
       const parent = o.directory.slice(0, o.directory.lastIndexOf("/")) || "/"
       const siblings = await this.folders(parent)
-      if (!siblings.includes(basename(o.directory))) {
+      if (!siblings?.includes(basename(o.directory))) {
         this.list.replaceChildren(h("div", "picker-empty error", `${o.directory} doesn't exist (or isn't a folder).`))
         return
       }

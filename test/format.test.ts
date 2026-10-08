@@ -1,8 +1,16 @@
 import { describe, expect, test } from "bun:test"
-import { describeTool, matchesQuery, summarizeTools, timeAgo, toolRow } from "../src/app/format"
+import { describeTool, matchesQuery, shellQuote, summarizeTools, timeAgo, toolRow } from "../src/app/format"
 import { previewBlocks, renderMarkdown } from "../src/app/markdown"
 import { buildPreview } from "../src/app/store"
 import type { Message } from "../src/app/types"
+
+test("resume commands quote paths without expanding shell syntax", async () => {
+  for (const value of ["/code/app with spaces", "/code/it's a project", "/code/$HOME/$(printf expanded)", "/code/line\nbreak"]) {
+    const proc = Bun.spawn(["sh", "-c", `printf %s ${shellQuote(value)}`], { stdout: "pipe", stderr: "pipe" })
+    expect(await new Response(proc.stdout).text()).toBe(value)
+    expect(await proc.exited).toBe(0)
+  }
+})
 
 describe("summarizeTools", () => {
   test("matches the transcript phrasing", () => {

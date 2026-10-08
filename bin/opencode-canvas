@@ -1,12 +1,18 @@
 #!/usr/bin/env bun
 import { parseArgs } from "node:util"
 import { startServer } from "../src/server/server"
+import { isLoopback, networkAddresses } from "../src/server/access"
 
 const { values } = parseArgs({
   args: Bun.argv.slice(2),
   options: {
     port: { type: "string", short: "p" },
     hostname: { type: "string" },
+    lan: { type: "boolean" },
+    "allow-host": { type: "string", multiple: true },
+    origin: { type: "string" },
+    "browser-bin": { type: "string" },
+    "no-browser": { type: "boolean" },
     server: { type: "string" },
     password: { type: "string" },
     username: { type: "string" },
@@ -26,6 +32,11 @@ Usage: opencode-canvas [options]
 
   -p, --port <n>        Port to listen on (default 4317, 0 = random)
       --hostname <h>    Interface to bind (default 127.0.0.1)
+      --lan             Bind to 0.0.0.0 for LAN access (requires CANVAS_PASSWORD)
+      --allow-host <h>  Allow a custom LAN hostname; repeat for multiple hosts
+      --origin <url>    Exact public origin for a trusted HTTPS reverse proxy
+      --browser-bin <p> Chrome/Chromium executable (or CANVAS_BROWSER_BIN)
+      --no-browser      Disable the integrated browser
       --server <url>    OpenCode server URL (default: the background service)
       --password <pw>   Server password (default: OPENCODE_SERVER_PASSWORD or service.json)
       --username <u>    Server username (default: opencode)
@@ -37,17 +48,18 @@ Usage: opencode-canvas [options]
   process.exit(0)
 }
 
-const hostname = values.hostname ?? "127.0.0.1"
-if (hostname !== "127.0.0.1" && hostname !== "localhost" && hostname !== "::1") {
-  console.warn(
-    `\x1b[33mwarning:\x1b[0m binding to ${hostname} exposes your OpenCode server (which can run shell commands) to the network with no extra auth.`,
-  )
-}
+const hostname = values.hostname ?? (values.lan ? "0.0.0.0" : "127.0.0.1")
 
 try {
-  const { server, upstream, upstreamError } = await startServer({
-    port: values.port !== undefined ? Number(values.port) : Number(process.env.PORT ?? 4317),
+  const port = Number(values.port ?? process.env.PORT ?? 4317)
+  if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("Port must be an integer from 0 to 65535.")
+  const { server, upstream, upstreamError, stop } = await startServer({
+    port,
     hostname,
+    allowedHosts: values["allow-host"],
+    publicOrigin: values.origin,
+    browserBin: values["browser-bin"],
+    browser: !values["no-browser"],
     server: values.server,
     password: values.password,
     username: values.username,
@@ -55,13 +67,29 @@ try {
     dev: !!values.dev,
     autostart: !values["no-autostart"],
   })
-  const url = `http://${hostname === "::1" ? "[::1]" : hostname}:${server.port}`
+  const localHost = hostname === "0.0.0.0" || hostname === "::" ? "127.0.0.1" : hostname
+  const url = `http://${localHost.includes(":") ? `[${localHost}]` : localHost}:${server.port}`
   const up = upstream()
   console.log(`\x1b[1mopencode-canvas\x1b[0m  ${url}`)
+  if (!isLoopback(hostname)) {
+    for (const address of networkAddresses().filter((address) => hostname === "::" || !address.includes(":"))) {
+      console.log(`  network   http://${address.includes(":") ? `[${address}]` : address}:${server.port}`)
+    }
+    console.log("  access    Canvas password required. Use a trusted LAN or HTTPS/VPN, not the public internet.")
+  }
   if (values.demo) console.log("  mode      simulated sessions (demo)")
   else if (up) console.log(`  opencode  ${up.url}${up.password ? "  (authenticated)" : ""}`)
   else console.log(`  opencode  \x1b[31munavailable\x1b[0m  ${upstreamError() ?? ""}`)
-  if (values.open) Bun.spawn([process.platform === "darwin" ? "open" : "xdg-open", url], { stdio: ["ignore", "ignore", "ignore"] })
+  if (values.open) Bun.spawn([process.platform === "darwin" ? "open" : "xdg-open", values.origin ?? url], { stdio: ["ignore", "ignore", "ignore"] })
+  let shuttingDown = false
+  const shutdown = async () => {
+    if (shuttingDown) return
+    shuttingDown = true
+    await stop()
+    process.exit(0)
+  }
+  process.once("SIGINT", shutdown)
+  process.once("SIGTERM", shutdown)
 } catch (e) {
   const msg = (e as Error).message
   console.error(`opencode-canvas: ${msg}`)

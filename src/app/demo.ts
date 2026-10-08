@@ -1,7 +1,7 @@
 // Simulated OpenCode: in-memory sessions that emit the same v2 events as the
 // real server. Used by --demo / ?demo, and handy for working on the UI.
 
-import type { Backend, ConnectionState, PromptInput } from "./backend"
+import type { Backend, CommandInput, ConnectionState, PromptInput } from "./backend"
 import type {
   Delivery,
   FormInfo,
@@ -312,14 +312,26 @@ export class DemoBackend implements Backend {
   }
   async listModels() {
     return [
-      { id: "claude-sonnet-5-5", providerID: "anthropic", name: "Claude Sonnet 5.5" },
-      { id: "claude-opus-5-5", providerID: "anthropic", name: "Claude Opus 5.5" },
-      { id: "deepseek-v4.1-flash", providerID: "openrouter", name: "DeepSeek V4.1 Flash" },
-      { id: "demo-model", providerID: "demo", name: "Demo model" },
+      { id: "claude-sonnet-5-5", providerID: "anthropic", name: "Claude Sonnet 5.5", variants: ["low", "medium", "high", "max"] },
+      { id: "claude-opus-5-5", providerID: "anthropic", name: "Claude Opus 5.5", variants: ["low", "medium", "high", "max"] },
+      { id: "deepseek-v4.1-flash", providerID: "openrouter", name: "DeepSeek V4.1 Flash", variants: ["none", "high"] },
+      { id: "demo-model", providerID: "demo", name: "Demo model", variants: ["low", "medium", "high"] },
     ]
   }
   async serverDefaultModel() {
-    return { id: "demo-model", providerID: "demo", name: "Demo model" }
+    return { id: "demo-model", providerID: "demo", name: "Demo model", variants: ["low", "medium", "high"] }
+  }
+  async listCommands() {
+    return [
+      { name: "init", description: "Guided AGENTS.md setup" },
+      { name: "review", description: "Review changes [commit|branch|pr]" },
+    ]
+  }
+  async command(id: string, input: CommandInput) {
+    await this.prompt(id, { ...input, text: `/${input.name}${input.text ? " " + input.text : ""}` })
+  }
+  async compact(id: string, delivery?: Delivery) {
+    await this.prompt(id, { text: "Compact the session context", delivery })
   }
   async listFolders(path: string) {
     if (path === "/Users/you" || path === "/Users/you/") return ["code", "Desktop", "Documents"]

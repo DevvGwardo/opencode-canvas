@@ -3,8 +3,9 @@
 
 import type { Backend } from "./backend"
 import type { CanvasView } from "./canvas"
-import { basename, timeAgo } from "./format"
-import { defaultModel, modelLabel, models, setDefaultModel } from "./models"
+import { CANVAS_COMMANDS, parseCommand, runCanvasCommand, sendPrompt, SlashCommands } from "./commands"
+import { basename, shellQuote, timeAgo } from "./format"
+import { defaultModel, effortLabel, modelLabel, modelRef, models, setDefaultModel, sessionModelOption, setSessionEffort } from "./models"
 import { spinner } from "./spinners"
 import type { Store } from "./store"
 import { toast } from "./toast"
@@ -26,6 +27,7 @@ export class SessionPanel {
   private projectEl: HTMLElement
   private statusEl: HTMLElement
   private modelBtn: HTMLButtonElement
+  private effortBtn: HTMLButtonElement
   private autoBadge: HTMLElement
   private subBtn: HTMLButtonElement
   private stopBtn: HTMLButtonElement
@@ -36,7 +38,12 @@ export class SessionPanel {
   private input: HTMLTextAreaElement
   private hint: HTMLElement
   private attachRow: HTMLElement
+  private slash: SlashCommands
+  private sendBtn: HTMLButtonElement
+  private queueBtn: HTMLButtonElement
   private popover?: HTMLElement
+  private drafts = new Map<string, { text: string; attachments: Array<{ uri: string; name: string }> }>()
+  private changingModel = false
 
   id?: string
   /** Set by the app once the tiled view exists. */
@@ -51,6 +58,7 @@ export class SessionPanel {
     private backend: Backend,
     private canvas: CanvasView,
     private onClosed: () => void,
+    private openBrowser: (url?: string) => void,
   ) {
     this.scrim = h("div", "scrim")
     this.scrim.addEventListener("pointerdown", () => this.close())
@@ -68,9 +76,15 @@ export class SessionPanel {
       e.stopPropagation()
       void this.toggleModels()
     })
+    this.effortBtn = h("button", "head-btn effort") as HTMLButtonElement
+    this.effortBtn.title = "Choose model effort"
+    this.effortBtn.addEventListener("click", (e) => {
+      e.stopPropagation()
+      void this.showEffortPicker()
+    })
     this.autoBadge = h("span", "auto-badge", "Auto-approve")
     this.autoBadge.hidden = true
-    left.append(this.projectEl, this.statusEl, this.modelBtn, this.autoBadge)
+    left.append(this.projectEl, this.statusEl, this.modelBtn, this.effortBtn, this.autoBadge)
     const right = h("div", "head-right")
     this.subBtn = h("button", "head-btn subagents") as HTMLButtonElement
     this.subBtn.addEventListener("click", (e) => {
@@ -86,7 +100,10 @@ export class SessionPanel {
       e.stopPropagation()
       this.toggleMenu()
     })
-    right.append(this.subBtn, this.stopBtn, this.menuBtn)
+    const browserBtn = h("button", "head-btn", "Browser") as HTMLButtonElement
+    browserBtn.title = "Open the integrated browser"
+    browserBtn.addEventListener("click", () => this.openBrowser())
+    right.append(this.subBtn, this.stopBtn, browserBtn, this.menuBtn)
     this.header.append(left, right)
 
     this.titleEl = h("h1", "panel-title")
@@ -109,10 +126,20 @@ export class SessionPanel {
     const row = h("div", "composer-row")
     this.input = h("textarea", "composer-input") as HTMLTextAreaElement
     this.input.rows = 1
+    this.input.setAttribute("aria-label", "Session message")
     this.input.spellcheck = true
     this.hint = h("span", "composer-hint")
-    row.append(this.input, this.hint)
+    const commands = h("button", "composer-command", "/") as HTMLButtonElement
+    commands.title = "Slash commands"
+    commands.setAttribute("aria-label", "Show slash commands")
+    commands.addEventListener("click", () => this.slash.open())
+    this.sendBtn = h("button", "composer-send", "Send") as HTMLButtonElement
+    this.sendBtn.addEventListener("click", () => void this.send(this.store.running.has(this.id ?? "") ? "steer" : undefined))
+    this.queueBtn = h("button", "composer-command", "Queue") as HTMLButtonElement
+    this.queueBtn.addEventListener("click", () => void this.send("queue"))
+    row.append(commands, this.input, this.hint, this.queueBtn, this.sendBtn)
     composer.append(this.attachRow, row)
+    this.slash = new SlashCommands(this.input, composer, backend)
     this.bindComposer()
 
     this.el.append(this.header, this.titleEl, this.line, this.transcript.scroller, composer)
@@ -138,10 +165,12 @@ export class SessionPanel {
   private targetRect() {
     const vw = innerWidth
     const vh = innerHeight
-    const w = Math.min(860, vw - 32)
+    const browser = document.querySelector<HTMLElement>(".browser-panel.visible:not(.expanded)")
+    const available = browser && vw >= 1000 ? browser.getBoundingClientRect().left - 8 : vw
+    const w = Math.min(860, available - 32)
     const top = vw < 640 ? 12 : 24
     const bottom = vw < 640 ? 64 : 74
-    return new DOMRect((vw - w) / 2, top, w, vh - top - bottom)
+    return new DOMRect((available - w) / 2, top, w, vh - top - bottom)
   }
 
   private applyGeometry(r: DOMRect, animate: boolean) {
@@ -155,16 +184,23 @@ export class SessionPanel {
   }
 
   open(id: string, from?: DOMRect) {
+    if (this.id === id && this.isOpen) return this.focusInput()
     const switching = this.isOpen
+    if (this.id && this.id !== id) this.saveDraft()
     this.id = id
     this.closing = false
-    this.attachments = []
+    const draft = this.drafts.get(id)
+    this.input.value = draft?.text ?? ""
+    this.input.style.height = "auto"
+    this.attachments = draft?.attachments ?? []
     this.renderAttachments()
     this.statusState = ""
     this.closePopover()
     this.canvas.setOpen(id)
     this.store.markViewed(id)
     this.renderHeader()
+    const directory = this.store.sessions.get(id)?.location.directory
+    if (directory) this.slash.setDirectory(directory)
 
     if (!switching) {
       this.el.classList.add("visible")
@@ -186,6 +222,8 @@ export class SessionPanel {
     if (!this.id || this.closing) return
     const id = this.id
     this.closing = true
+    this.saveDraft()
+    this.slash.close()
     this.closePopover()
     this.input.blur()
     const rect = this.canvas.cardRect(id)
@@ -233,6 +271,8 @@ export class SessionPanel {
         : `${s.outcome === "failed" ? "Failed" : s.outcome === "interrupted" ? "Stopped" : "Done"} · ${timeAgo(s.time.idle ?? s.time.updated)}`
     this.el.classList.toggle("working", working)
     this.modelBtn.textContent = modelLabel(s.model)
+    this.effortBtn.textContent = effortLabel(s.model?.variant)
+    this.effortBtn.disabled = this.modelBtn.disabled = this.changingModel
     const auto = this.store.autoApproveAll || this.store.sessionAutoApproves(id)
     this.autoBadge.hidden = !auto
     this.autoBadge.title = this.store.sessionAutoApproves(id)
@@ -246,6 +286,8 @@ export class SessionPanel {
     this.input.placeholder = working ? "Steer…" : this.transcript.messages.length ? "Reply…" : "Ask anything…"
     this.hint.textContent = working ? "Tab to queue" : ""
     this.hint.hidden = !working
+    this.sendBtn.textContent = working ? "Steer" : "Send"
+    this.queueBtn.hidden = !working
   }
 
 
@@ -361,7 +403,7 @@ export class SessionPanel {
     list.append(h("div", "pop-empty", "Loading models…"))
     let all: Awaited<ReturnType<typeof models>>
     try {
-      all = await models(this.backend)
+      all = await models(this.backend, s.location.directory)
     } catch (e) {
       list.replaceChildren(h("div", "pop-empty", `Couldn't list models: ${(e as Error).message}`))
       return
@@ -382,13 +424,23 @@ export class SessionPanel {
           const key = `${m.providerID}/${m.id}`
           const b = h("button", `pop-item${key === current ? " current" : ""}`) as HTMLButtonElement
           b.append(h("span", "pop-label", m.name), h("span", "pop-sub", key + (pinned && `${pinned.providerID}/${pinned.id}` === key ? " · default for new sessions" : "")))
-          b.addEventListener("click", () => {
+          b.addEventListener("click", async () => {
             this.closePopover()
-            const ref = { id: m.id, providerID: m.providerID }
-            setDefaultModel(ref)
-            s.model = ref
+            const ref = modelRef(m, s.model)
+            this.changingModel = true
             this.renderHeader()
-            void this.transcript.act(() => this.backend.switchModel(id, ref))
+            try {
+              await this.backend.switchModel(id, ref)
+              const current = this.store.sessions.get(id)
+              if (current) current.model = ref
+              setDefaultModel(ref)
+              this.store.touchCard(id)
+            } catch (e) {
+              toast(`Couldn't switch model: ${(e as Error).message}`)
+            } finally {
+              this.changingModel = false
+              this.renderHeader()
+            }
           })
           return b
         }),
@@ -403,6 +455,47 @@ export class SessionPanel {
     })
     draw()
     filter.focus()
+  }
+
+  showModelPicker() {
+    return this.toggleModels()
+  }
+
+  async showEffortPicker() {
+    if (this.popover) return this.closePopover()
+    const id = this.id
+    const s = id ? this.store.sessions.get(id) : undefined
+    if (!id || !s) return
+    try {
+      const option = await sessionModelOption(this.backend, s)
+      if (this.id !== id || !this.isOpen) return
+      const variants = option?.variants ?? []
+      this.showPopover(this.effortBtn, ["default", ...variants].map((variant) => ({
+        label: variant === "default" ? "Default effort" : effortLabel(variant),
+        sub: variant === (s.model?.variant ?? "default") ? "Current effort" : variant === "default" ? "Use OpenCode's configured effort" : undefined,
+        run: () => void this.changeEffort(variant).catch((e) => toast(`Couldn't change effort: ${(e as Error).message}`)),
+      })))
+      if (!variants.length) toast("This model doesn't advertise custom effort levels")
+    } catch (e) {
+      toast(`Couldn't list effort levels: ${(e as Error).message}`)
+    }
+  }
+
+  private async changeEffort(variant: string) {
+    const id = this.id
+    const s = id ? this.store.sessions.get(id) : undefined
+    if (!id || !s || this.changingModel) return
+    this.changingModel = true
+    this.renderHeader()
+    try {
+      await setSessionEffort(this.backend, s, variant)
+      const current = this.store.sessions.get(id)
+      if (current) current.model = s.model
+      this.store.touchCard(id)
+    } finally {
+      this.changingModel = false
+      this.renderHeader()
+    }
   }
 
   private async setAuto(id: string, on: boolean) {
@@ -421,7 +514,7 @@ export class SessionPanel {
     const s = id ? this.store.sessions.get(id) : undefined
     if (!id || !s) return
     const copy = (text: string, what: string) => {
-      navigator.clipboard.writeText(text).then(
+      this.copyText(text).then(
         () => toast(`Copied ${what}`),
         () => toast("Clipboard unavailable"),
       )
@@ -438,13 +531,32 @@ export class SessionPanel {
               : { label: "Pin to Tiles", sub: "Keep its chat in the tiled view", run: () => this.tiles!.togglePin(id) },
           ]
         : []),
-      { label: "Copy resume command", sub: `opencode -s ${id}`, run: () => copy(`cd ${JSON.stringify(s.location.directory)} && opencode -s ${id}`, "resume command") },
+      { label: "Copy resume command", sub: `opencode -s ${id}`, run: () => copy(`cd ${shellQuote(s.location.directory)} && opencode -s ${shellQuote(id)}`, "resume command") },
       { label: "Copy session ID", sub: id, run: () => copy(id, "session ID") },
       { label: "Rename", run: () => this.beginRename() },
     ]
     if (s.parentID && this.store.sessions.has(s.parentID))
       items.unshift({ label: "Open parent session", sub: this.store.title(this.store.sessions.get(s.parentID)!), run: () => this.open(s.parentID!) })
     this.showPopover(this.menuBtn, items)
+  }
+
+  private async copyText(text: string) {
+    try {
+      if (navigator.clipboard) return await navigator.clipboard.writeText(text)
+    } catch { /* Plain HTTP LAN pages need the legacy clipboard fallback. */ }
+    const input = h("textarea") as HTMLTextAreaElement
+    input.value = text
+    input.readOnly = true
+    input.style.cssText = "position:fixed;left:-9999px;top:0"
+    const focused = document.activeElement instanceof HTMLElement ? document.activeElement : undefined
+    document.body.append(input)
+    try {
+      input.select()
+      if (!document.execCommand("copy")) throw new Error("Clipboard unavailable")
+    } finally {
+      input.remove()
+      focused?.focus()
+    }
   }
 
   // ---- composer -----------------------------------------------------------------
@@ -459,6 +571,7 @@ export class SessionPanel {
     input.addEventListener("keydown", (e) => {
       e.stopPropagation()
       if (e.isComposing) return
+      if (this.slash.onKey(e)) return
       if (e.key === "Enter" && !e.shiftKey && !e.altKey) {
         e.preventDefault()
         void this.send(this.store.running.has(this.id ?? "") ? "steer" : undefined)
@@ -479,8 +592,14 @@ export class SessionPanel {
       if (!files.length) return
       e.preventDefault()
       for (const f of files) {
+        if (f.size > 8 * 1024 * 1024) {
+          toast("Images must be smaller than 8 MB")
+          continue
+        }
+        const id = this.id
         const reader = new FileReader()
         reader.onload = () => {
+          if (this.id !== id || this.closing) return
           this.attachments.push({ uri: String(reader.result), name: f.name || "image.png" })
           this.renderAttachments()
         }
@@ -493,8 +612,14 @@ export class SessionPanel {
       if (!files.length) return
       e.preventDefault()
       for (const f of files) {
+        if (f.size > 8 * 1024 * 1024) {
+          toast("Images must be smaller than 8 MB")
+          continue
+        }
+        const id = this.id
         const reader = new FileReader()
         reader.onload = () => {
+          if (this.id !== id || this.closing) return
           this.attachments.push({ uri: String(reader.result), name: f.name })
           this.renderAttachments()
         }
@@ -524,16 +649,37 @@ export class SessionPanel {
 
   private async send(delivery: "steer" | "queue" | undefined) {
     const id = this.id
+    const draft = this.input.value
     const text = this.input.value.trim()
     if (!id || (!text && !this.attachments.length)) return
+    const command = parseCommand(text)
+    if (command && CANVAS_COMMANDS.some((c) => c.name === command.name)) {
+      try {
+        await runCanvasCommand(text, {
+          help: () => this.slash.open(),
+          model: () => this.showModelPicker(),
+          effort: (variant) => variant ? this.changeEffort(variant) : this.showEffortPicker(),
+          compact: async () => { await this.backend.compact(id, delivery); this.transcript.scheduleRefetch(80) },
+          stop: () => this.interrupt(),
+          browser: (url) => this.openBrowser(url),
+        })
+        if (command.name !== "help" && this.id === id && this.input.value === draft) this.input.value = ""
+        this.slash.close()
+        if (command.name === "help") this.slash.update()
+      } catch (e) {
+        toast((e as Error).message)
+      }
+      return
+    }
     const files = this.attachments.length ? [...this.attachments] : undefined
     this.input.value = ""
     this.input.style.height = "auto"
     this.attachments = []
     this.renderAttachments()
+    this.slash.close()
     // Optimistic: show it as pending until the server confirms.
     const temp: InboxItem = {
-      id: `local_${Date.now()}`,
+      id: `local_${Date.now()}_${Math.random().toString(36).slice(2)}`,
       sessionID: id,
       type: "user",
       payload: { text },
@@ -541,16 +687,28 @@ export class SessionPanel {
     }
     this.transcript.addPending(temp)
     try {
-      await this.backend.prompt(id, { text, delivery, files })
+      await sendPrompt(this.backend, id, text, delivery, files)
       this.transcript.scheduleRefetch(80)
     } catch (e) {
       this.transcript.removePending(temp)
-      this.input.value = text
+      if (this.id === id && !this.input.value) {
+        this.input.value = draft
+        this.attachments = [...(files ?? []).map((f) => ({ ...f, name: f.name ?? "image.png" })), ...this.attachments]
+        this.renderAttachments()
+      } else if (this.id !== id && !this.drafts.get(id)?.text) {
+        this.drafts.set(id, { text: draft, attachments: (files ?? []).map((f) => ({ ...f, name: f.name ?? "image.png" })) })
+      }
       toast(`Couldn't send: ${(e as Error).message}`)
     }
   }
 
   focusInput() {
     this.input.focus()
+  }
+
+  private saveDraft() {
+    if (!this.id) return
+    if (this.input.value || this.attachments.length) this.drafts.set(this.id, { text: this.input.value, attachments: [...this.attachments] })
+    else this.drafts.delete(this.id)
   }
 }

@@ -25,10 +25,18 @@ export interface PromptInput {
   files?: Array<{ uri: string; name?: string }>
 }
 
-export interface ModelOption {
-  id: string
-  providerID: string
+export interface CommandInput extends PromptInput {
   name: string
+}
+
+export interface CommandOption {
+  name: string
+  description?: string
+}
+
+export interface ModelOption extends ModelRef {
+  name: string
+  variants?: string[]
 }
 
 export interface Backend {
@@ -44,9 +52,12 @@ export interface Backend {
   forms(id: string): Promise<FormInfo[]>
   createSession(directory: string, model?: ModelRef, permissions?: PermissionRule[]): Promise<Session>
   setSessionPermissions(id: string, rules: PermissionRule[] | null): Promise<void>
-  listModels(): Promise<ModelOption[]>
+  listModels(directory?: string): Promise<ModelOption[]>
   /** The model OpenCode uses when a session doesn't pick one. */
-  serverDefaultModel(): Promise<ModelOption | undefined>
+  serverDefaultModel(directory?: string): Promise<ModelOption | undefined>
+  listCommands(directory?: string): Promise<CommandOption[]>
+  command(id: string, input: CommandInput): Promise<void>
+  compact(id: string, delivery?: Delivery): Promise<void>
   /** Subfolders of an absolute path; rejects if it isn't a readable folder. */
   listFolders(path: string): Promise<string[]>
   switchModel(id: string, model: ModelRef): Promise<void>
@@ -93,6 +104,8 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 }
 
 const enc = encodeURIComponent
+const locationQuery = (directory?: string) =>
+  directory ? `?${new URLSearchParams({ "location[directory]": directory })}` : ""
 
 // Most v2 endpoints wrap their payload in { data }.
 const unwrap = <T>(r: { data: T } | T): T => (r && typeof r === "object" && "data" in (r as any) ? (r as any).data : r) as T
@@ -112,7 +125,9 @@ export class LiveBackend implements Backend {
       const q = cursor ? `cursor=${enc(cursor)}&limit=${limit}` : `limit=${limit}&order=desc`
       const page = await request<Page<Session>>("GET", `/api/session?${q}`)
       out.push(...page.data)
-      cursor = page.cursor?.next ?? undefined
+      const next = page.cursor?.next ?? undefined
+      if (next === cursor) break
+      cursor = next
       if (!cursor || page.data.length < limit) break
     }
     return out
@@ -156,23 +171,36 @@ export class LiveBackend implements Backend {
     return unwrap(await request<{ data: Session }>("POST", "/api/session", body))
   }
 
-  async listModels() {
-    const all = unwrap(await request<{ data: any[] }>("GET", "/api/model")) ?? []
+  async listModels(directory?: string) {
+    const all = unwrap(await request<{ data: any[] }>("GET", "/api/model" + locationQuery(directory))) ?? []
     return all
       .filter((m) => m.enabled !== false && m.status !== "deprecated")
-      .map((m) => ({ id: String(m.id), providerID: String(m.providerID), name: String(m.name ?? m.id) }))
+      .map(modelOption)
   }
 
-  async serverDefaultModel() {
-    const r = await request<{ data: any }>("GET", "/api/model/default")
+  async serverDefaultModel(directory?: string) {
+    const r = await request<{ data: any }>("GET", "/api/model/default" + locationQuery(directory))
     const m = r?.data
-    // Only the identity: this payload also carries provider credentials.
-    return m?.id ? { id: String(m.id), providerID: String(m.providerID), name: String(m.name ?? m.id) } : undefined
+    return m?.id ? modelOption(m) : undefined
+  }
+
+  async listCommands(directory?: string) {
+    return unwrap(await request<{ data: CommandOption[] }>("GET", "/api/command" + locationQuery(directory))) ?? []
+  }
+
+  async command(id: string, input: CommandInput) {
+    await request("POST", `/api/session/${enc(id)}/command`, input)
+  }
+
+  async compact(id: string, delivery?: Delivery) {
+    await request("POST", `/api/session/${enc(id)}/compact`, { delivery })
   }
 
   async listFolders(path: string) {
     const r = await request<{ data: Array<{ path: string; type: string }> }>("GET", `/api/fs/list?path=${enc(path)}`)
-    return (r.data ?? []).filter((e) => e.type === "directory").map((e) => e.path.replace(/\/+$/, ""))
+    return (r.data ?? [])
+      .filter((e) => e.type === "directory")
+      .map((e) => e.path.replace(/\/+$/, "").split("/").pop()!)
   }
 
   async switchModel(id: string, model: ModelRef) {
@@ -269,4 +297,17 @@ export function attachmentSrc(f: FileAttachment): string | undefined {
   if (f.source && f.source.type === "uri") return f.source.uri
   if (f.data) return `data:${f.mime};base64,${f.data}`
   return undefined
+}
+
+export function modelOption(m: any): ModelOption {
+  const variants = Array.isArray(m.variants)
+    ? m.variants.map((v: any) => typeof v === "string" ? v : v?.id).filter((v: unknown): v is string => typeof v === "string")
+    : []
+  return {
+    id: String(m.id),
+    providerID: String(m.providerID),
+    name: String(m.name ?? m.id),
+    ...(typeof m.variant === "string" ? { variant: m.variant } : {}),
+    variants: [...new Set<string>(variants)],
+  }
 }
