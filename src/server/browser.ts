@@ -148,7 +148,7 @@ export class BrowserHost {
       "--no-first-run", "--no-default-browser-check", "--disable-background-networking",
       "--disable-component-update", "--disable-sync", "--disable-extensions", "--mute-audio",
       "about:blank",
-    ], { stdout: "ignore", stderr: "ignore", stdin: "ignore" })
+    ], { stdout: "ignore", stderr: process.env.CANVAS_DEBUG_BROWSER ? "inherit" : "ignore", stdin: "ignore" })
     let port: number | undefined
     // A cold start on a slow host (CI runners, first launch) can take well over 10s.
     for (let i = 0; i < 300; i++) {
