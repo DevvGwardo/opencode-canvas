@@ -15,4 +15,7 @@ jobs:
           bun-version: 1.2.21
       - run: bun install --frozen-lockfile
       - run: bun run typecheck
+      # Ubuntu 24.04 blocks the unprivileged user namespaces Chrome's sandbox
+      # needs, so the real-Chromium tests hang at startup without this.
+      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - run: bun test
