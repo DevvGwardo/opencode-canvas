@@ -4,10 +4,12 @@ import { previewBlocks } from "./markdown"
 import { spinner } from "./spinners"
 import { REVIEW_WINDOW, type Status, type Store } from "./store"
 import { timeAgo } from "./format"
+import { formatCost } from "./layouts"
 
 export interface CardEls {
   root: HTMLElement
   title: HTMLElement
+  meta: HTMLElement
   body: HTMLElement
   text: HTMLElement
   bullets: HTMLElement
@@ -32,6 +34,8 @@ export function createSessionCard(id: string): CardEls {
   const accent = el("div", "card-accent")
   root.append(accent)
   const title = el("div", "card-title")
+  // Agent, model, spend and run time; only the agents layout shows it.
+  const meta = el("div", "card-meta")
   const body = el("div", "card-body")
   const text = el("p", "card-text")
   const bullets = el("ul", "card-bullets")
@@ -40,8 +44,8 @@ export function createSessionCard(id: string): CardEls {
   const status = el("span", "card-status")
   const sub = el("span", "card-sub")
   foot.append(status, sub)
-  root.append(title, body, foot)
-  return { root, title, body, text, bullets, status, sub, state: "" }
+  root.append(title, meta, body, foot)
+  return { root, title, meta, body, text, bullets, status, sub, state: "" }
 }
 
 export function createNewCard(groupKey: string): HTMLElement {
@@ -49,6 +53,8 @@ export function createNewCard(groupKey: string): HTMLElement {
   root.dataset.id = `new:${groupKey}`
   root.dataset.group = groupKey
   root.setAttribute("role", "button")
+  // Roving tabindex: the canvas gives exactly one card tabindex 0.
+  root.tabIndex = -1
   root.innerHTML = `<span class="plus">+</span> New session`
   return root
 }
@@ -136,7 +142,20 @@ export function updateSessionCard(c: CardEls, store: Store, id: string, now = Da
   }
   c.root.setAttribute("aria-label", `${store.title(s)}, ${STATUS_TEXT[status]}`)
 
+  const end = working ? now : (s.time.idle ?? s.time.updated)
+  const meta = [s.agent, s.model?.id, s.cost > 0 ? formatCost(s.cost) : "", duration(end - s.time.created)]
+  setText(c.meta, meta.filter(Boolean).join(" · "))
+
   const n = store.subagentCount(id)
   setText(c.sub, n ? `${n} subagent${n === 1 ? "" : "s"}` : "")
   c.root.classList.toggle("has-sub", n > 0)
+}
+
+function duration(ms: number) {
+  const sec = Math.max(0, Math.round(ms / 1000))
+  if (sec < 60) return `${sec}s`
+  const m = Math.floor(sec / 60)
+  if (m < 60) return `${m}m ${String(sec % 60).padStart(2, "0")}s`
+  const h = Math.floor(m / 60)
+  return h < 48 ? `${h}h ${String(m % 60).padStart(2, "0")}m` : `${Math.floor(h / 24)}d`
 }

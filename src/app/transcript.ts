@@ -4,11 +4,12 @@
 
 import { attachmentSrc, type Backend } from "./backend"
 import { describeTool, summarizeTools, toolOutput, toolRow, truncate } from "./format"
+import { questionForm } from "./forms"
 import { renderMarkdown } from "./markdown"
 import { spinner } from "./spinners"
 import type { Store } from "./store"
 import { toast } from "./toast"
-import type { AssistantPart, FileAttachment, FormField, FormInfo, InboxItem, Message, OcEvent, PermissionRequest } from "./types"
+import type { AssistantPart, FileAttachment, FormInfo, InboxItem, Message, OcEvent, PermissionRequest } from "./types"
 
 type ActivityItem =
   | { kind: "tool"; key: string; name: string; input?: Record<string, any>; status: string; output?: string }
@@ -63,6 +64,7 @@ export class Transcript {
   private refetchTimer?: ReturnType<typeof setTimeout>
   private renderQueued = false
   private loadSeq = 0
+  private sessionSeq = 0
   private off: () => void
 
   constructor(
@@ -84,11 +86,16 @@ export class Transcript {
       cards: (ids) => {
         if (this.id && ids.has(this.id)) this.queueRender()
       },
+      connection: (state) => {
+        if (state === "live" && this.id) this.scheduleRefetch(0)
+      },
     })
   }
 
   /** Show a session (or nothing). Resets state and loads the latest page. */
   setSession(id: string | undefined) {
+    this.sessionSeq++
+    this.loadSeq++
     this.id = id
     this.messages = []
     this.inbox = []
@@ -97,11 +104,13 @@ export class Transcript {
     this.expanded.clear()
     this.list.replaceChildren()
     this.earlier.hidden = true
+    this.earlier.textContent = "Load earlier messages"
     if (this.refetchTimer) clearTimeout(this.refetchTimer)
     this.refetchTimer = undefined
     if (id) {
       this.queueRender()
       void this.load(true)
+      void this.store.syncAsks(id)
     }
   }
 
@@ -120,6 +129,8 @@ export class Transcript {
     this.off()
     if (this.refetchTimer) clearTimeout(this.refetchTimer)
     this.id = undefined
+    this.sessionSeq++
+    this.loadSeq++
   }
 
   async load(scrollToEnd: boolean) {
@@ -133,11 +144,24 @@ export class Transcript {
       ])
       if (seq !== this.loadSeq || id !== this.id) return
       const latest = [...page.data].reverse()
+      // A transient empty snapshot (e.g. while plugins settle) must not wipe the
+      // transcript we already loaded.
+      if (!latest.length && this.messages.length) {
+        this.inbox = inbox
+        this.render(scrollToEnd)
+        return
+      }
       // Keep any older pages already loaded above the newest page.
       if (this.messages.length > latest.length && latest.length) {
         const firstNew = latest[0].id
         const idx = this.messages.findIndex((m) => m.id === firstNew)
-        this.messages = idx >= 0 ? [...this.messages.slice(0, idx), ...latest] : latest
+        if (idx >= 0) this.messages = [...this.messages.slice(0, idx), ...latest]
+        else {
+          // The conversation grew past one page since we loaded: append only the
+          // messages we don't already show so older pages survive.
+          const known = new Set(this.messages.map((m) => m.id))
+          this.messages = [...this.messages, ...latest.filter((m) => !known.has(m.id))]
+        }
       } else {
         this.messages = latest
         this.cursorOlder = page.data.length >= this.opts.pageSize ? page.cursor?.next : undefined
@@ -145,7 +169,7 @@ export class Transcript {
       this.inbox = inbox
       this.render(scrollToEnd)
     } catch (e) {
-      if (id === this.id) toast(`Couldn't load session: ${(e as Error).message}`)
+      if (id === this.id && seq === this.loadSeq) toast(`Couldn't load session: ${(e as Error).message}`)
     }
   }
 
@@ -153,19 +177,26 @@ export class Transcript {
     const id = this.id
     const cursor = this.cursorOlder
     if (!id || !cursor) return
+    const seq = this.sessionSeq
     this.cursorOlder = undefined
     this.earlier.textContent = "Loading…"
     try {
       const page = await this.backend.messages(id, this.opts.pageSize, cursor)
-      if (id !== this.id) return
+      if (id !== this.id || seq !== this.sessionSeq) return
       const before = this.scroller.scrollHeight
-      const older = [...page.data].reverse().filter((m) => !this.messages.some((x) => x.id === m.id))
+      const known = new Set(this.messages.map((m) => m.id))
+      const older = [...page.data].reverse().filter((m) => !known.has(m.id))
       this.messages = [...older, ...this.messages]
       this.cursorOlder = page.data.length >= this.opts.pageSize ? page.cursor?.next : undefined
       this.render(false)
       this.scroller.scrollTop += this.scroller.scrollHeight - before
+    } catch (e) {
+      if (id !== this.id || seq !== this.sessionSeq) return
+      this.cursorOlder = cursor
+      this.earlier.hidden = false
+      toast(`Couldn't load earlier messages: ${(e as Error).message}`)
     } finally {
-      this.earlier.textContent = "Load earlier messages"
+      if (seq === this.sessionSeq) this.earlier.textContent = "Load earlier messages"
     }
   }
 
@@ -340,12 +371,12 @@ export class Transcript {
           out.push({ kind: "divider", key: m.id, text: "Context compacted" })
           break
         case "model-switched": {
-          const model = (m as any).model
+          const model = m.model
           if (model?.id) out.push({ kind: "divider", key: m.id, text: `Switched to ${model.id}` })
           break
         }
         case "agent-switched": {
-          const agent = (m as any).agent
+          const agent = m.agent
           if (agent) out.push({ kind: "divider", key: m.id, text: `Switched to ${typeof agent === "string" ? agent : agent.name ?? "agent"}` })
           break
         }
@@ -355,8 +386,12 @@ export class Transcript {
 
     const id = this.id!
     for (const item of this.inbox) out.push({ kind: "inbox", key: `inbox:${item.id}`, item })
-    for (const req of this.store.permissions.get(id) ?? []) out.push({ kind: "permission", key: `perm:${req.id}`, req, pending: this.store.pendingPermissionCount() })
-    for (const form of this.store.forms.get(id) ?? []) out.push({ kind: "form", key: `form:${form.id}`, form })
+    for (const sid of this.store.pendingInputSessions(id)) {
+      const session = this.store.sessions.get(sid)
+      if (sid !== id) out.push({ kind: "divider", key: `asks:${sid}`, text: `Subagent · ${session ? this.store.title(session) : sid}` })
+      for (const req of this.store.permissions.get(sid) ?? []) out.push({ kind: "permission", key: `perm:${sid}:${req.id}`, req, pending: this.store.pendingPermissionCount() })
+      for (const form of this.store.forms.get(sid) ?? []) out.push({ kind: "form", key: `form:${sid}:${form.id}`, form })
+    }
     // A live tool row already says what's happening; don't repeat it.
     const last = [...out].reverse().find((b) => b.kind !== "inbox")
     const liveActivity =
@@ -554,12 +589,7 @@ export class Transcript {
       const b = h("button", `btn ${cls}`, label) as HTMLButtonElement
       b.addEventListener("click", () =>
         this.act(async () => {
-          await this.backend.replyPermission(req.sessionID, req.id, decision)
-          this.store.permissions.set(
-            req.sessionID,
-            (this.store.permissions.get(req.sessionID) ?? []).filter((p) => p.id !== req.id),
-          )
-          this.store.touchCard(req.sessionID)
+          await this.store.replyPermission(req, decision)
         }),
       )
       return b
@@ -592,76 +622,16 @@ export class Transcript {
   private renderForm(form: FormInfo) {
     const row = h("div", "msg ask")
     row.append(h("div", "gutter", "Question"))
-    const body = h("form", "body ask-form") as HTMLFormElement
-    body.append(h("div", "ask-title", form.title))
-    const getters: Array<[FormField, () => unknown]> = []
-    for (const f of form.fields) {
-      if (f.hidden) continue
-      const field = h("label", "field")
-      if (f.title) field.append(h("span", "field-title", f.title))
-      if (f.description) field.append(h("span", "field-desc", f.description))
-      if (f.type === "boolean") {
-        const cb = h("input") as HTMLInputElement
-        cb.type = "checkbox"
-        cb.checked = !!f.default
-        field.classList.add("inline")
-        field.prepend(cb)
-        getters.push([f, () => cb.checked])
-      } else if (f.type === "multiselect") {
-        const boxes: HTMLInputElement[] = []
-        for (const o of f.options ?? []) {
-          const l = h("label", "opt")
-          const cb = h("input") as HTMLInputElement
-          cb.type = "checkbox"
-          cb.value = o.value
-          cb.checked = Array.isArray(f.default) && f.default.includes(o.value)
-          boxes.push(cb)
-          l.append(cb, document.createTextNode(" " + o.label))
-          field.append(l)
-        }
-        getters.push([f, () => boxes.filter((b) => b.checked).map((b) => b.value)])
-      } else if (f.type === "string" && f.options?.length && !f.custom) {
-        const sel = h("select") as HTMLSelectElement
-        for (const o of f.options) {
-          const opt = h("option", "", o.label) as HTMLOptionElement
-          opt.value = o.value
-          sel.append(opt)
-        }
-        if (f.default) sel.value = f.default
-        field.append(sel)
-        getters.push([f, () => sel.value])
-      } else if (f.type === "external") {
-        field.append(h("span", "dim", "Answer this one in OpenCode."))
-      } else {
-        const inp = h("input") as HTMLInputElement
-        inp.type = f.type === "number" || f.type === "integer" ? "number" : "text"
-        if (f.type === "integer") inp.step = "1"
-        inp.placeholder = f.placeholder ?? ""
-        if (f.default !== undefined) inp.value = String(f.default)
-        inp.required = !!f.required
-        field.append(inp)
-        getters.push([f, () => (inp.type === "number" ? (inp.value === "" ? undefined : Number(inp.value)) : inp.value)])
-      }
-      body.append(field)
-    }
-    const actions = h("div", "ask-actions")
-    const submit = h("button", "btn primary", "Answer") as HTMLButtonElement
-    submit.type = "submit"
-    const cancel = h("button", "btn ghost", "Dismiss") as HTMLButtonElement
-    cancel.type = "button"
-    cancel.addEventListener("click", () => this.act(() => this.backend.cancelForm(form.sessionID, form.id)))
-    actions.append(submit, cancel)
-    body.append(actions)
-    body.addEventListener("submit", (e) => {
-      e.preventDefault()
-      const answer: Record<string, unknown> = {}
-      for (const [f, get] of getters) {
-        const v = get()
-        if (v !== undefined && v !== "") answer[f.key] = v
-      }
-      void this.act(() => this.backend.replyForm(form.sessionID, form.id, answer))
-    })
-    row.append(body)
+    row.append(questionForm(form,
+      async (answer) => {
+        await this.store.replyForm(form, answer)
+        this.scheduleRefetch(50)
+      },
+      async () => {
+        await this.store.cancelForm(form)
+        this.scheduleRefetch(50)
+      },
+    ))
     return row
   }
 

@@ -40,6 +40,8 @@ describe("model choices", () => {
     expect(defaultModel()).toBeUndefined()
     values.set("occ.model", "{bad")
     expect(defaultModel()).toBeUndefined()
+    values.set("occ.model", "openrouter/")
+    expect(defaultModel()).toBeUndefined()
   })
 
   test("uses variant IDs without forwarding provider settings", () => {

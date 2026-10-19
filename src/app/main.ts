@@ -41,7 +41,7 @@ const pref = {
   },
 }
 
-const LAYOUT_LABEL: Record<LayoutName, string> = { satellites: "Satellites", fold: "Fold", tabs: "Tabs", tree: "Tree" }
+const LAYOUT_LABEL: Record<LayoutName, string> = { satellites: "Satellites", fold: "Fold", tabs: "Tabs", tree: "Tree", agents: "Agents" }
 const SPINNER_LABEL: Record<SpinnerStyle, string> = { wave: "Wave", matrix: "Matrix", braid: "Braid", mist: "Mist", comet: "Comet" }
 
 async function getConfig(): Promise<CanvasConfig> {
@@ -310,7 +310,7 @@ async function boot() {
   const spinSeg = segmented(SPINNERS, SPINNER_LABEL, spinnerStyle, (v) => setSpinner(v), "Spinner")
   // The spinner only shows on working cards, often tiny or off screen, so each
   // button previews its own animation.
-  layoutSeg.group.title = "How sessions are arranged on the canvas (1–4)"
+  layoutSeg.group.title = "How sessions are arranged on the canvas (1–5)"
   spinSeg.group.title = "Animation shown on working sessions"
   spinSeg.group.querySelectorAll<HTMLButtonElement>(".seg-btn").forEach((b, i) => {
     b.prepend(spinner(12, "seg-spin", SPINNERS[i]))
@@ -408,10 +408,11 @@ async function boot() {
         <dt>Scroll · drag</dt><dd>Pan</dd>
         <dt>Pinch · ⌘/Ctrl + scroll</dt><dd>Zoom</dd>
         <dt>← ↑ → ↓</dt><dd>Move between sessions</dd>
+        <dt>Tab</dt><dd>Reach the canvas from the page, then arrows move between cards</dd>
         <dt>Enter · click</dt><dd>Open a stack or session</dd>
         <dt>Esc</dt><dd>Step back one level</dd>
         <dt>/ · ⌘K · type</dt><dd>Search</dd>
-        <dt>1 – 4</dt><dd>Satellites, Fold, Tabs, Tree</dd>
+        <dt>1 – 5</dt><dd>Satellites, Fold, Tabs, Tree, Agents</dd>
         <dt>0 · double-click</dt><dd>Fit everything</dd>
         <dt>N</dt><dd>New session: pick a project or type a folder path</dd>
         <dt>T</dt><dd>Tiles: every running session's chat side by side</dd>
@@ -454,7 +455,7 @@ async function boot() {
     if (!list.length) return toast("Nothing needs you right now")
     const i = canvas.selected ? list.indexOf(canvas.selected) : -1
     const next = list[(i + dir + list.length) % list.length]
-    canvas.select(next, false)
+    canvas.select(next, false, true)
     canvas.centerOn(next, Math.max(0.8, canvas.camera.z))
   }
 
@@ -481,13 +482,15 @@ async function boot() {
       if (canvas.closeStack()) return
       return canvas.select(undefined)
     }
+    if (panel.isOpen) {
+      // With the panel open, letter keys type into its composer (consistent with
+      // every other letter) rather than triggering canvas shortcuts.
+      if (e.key.length === 1 && !e.metaKey && !e.ctrlKey && !e.altKey) panel.focusInput()
+      return
+    }
     if ((e.key === "b" || e.key === "B") && !e.metaKey && !e.ctrlKey && !e.altKey) {
       e.preventDefault()
       return browser.isOpen ? browser.close() : browser.open()
-    }
-    if (panel.isOpen) {
-      if (e.key.length === 1 && !e.metaKey && !e.ctrlKey && !e.altKey) panel.focusInput()
-      return
     }
     if ((e.key === "t" || e.key === "T") && !e.metaKey && !e.ctrlKey && !e.altKey) {
       e.preventDefault()
@@ -528,7 +531,7 @@ async function boot() {
       e.preventDefault()
       return canvas.activate(canvas.selected)
     }
-    if (/^[1-4]$/.test(e.key)) return setLayout(LAYOUTS[Number(e.key) - 1])
+    if (/^[1-5]$/.test(e.key)) return setLayout(LAYOUTS[Number(e.key) - 1])
     if (e.key === "0") return canvas.fitAll()
     if (e.key === "=" || e.key === "+") return canvas.zoomBy(1.25)
     if (e.key === "-") return canvas.zoomBy(0.8)

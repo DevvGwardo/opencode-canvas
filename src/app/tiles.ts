@@ -250,7 +250,7 @@ class Tile {
     if (command && CANVAS_COMMANDS.some((c) => c.name === command.name)) {
       try {
         await runCanvasCommand(text, {
-          help: () => this.slash.open(),
+          help: () => this.slash.open(true),
           model: () => this.view.openOnCanvas(this.id, "model"),
           effort: async (variant) => {
             if (!variant) return this.view.openOnCanvas(this.id, "effort")

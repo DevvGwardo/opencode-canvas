@@ -88,6 +88,15 @@ describe("permissions", () => {
     expect(patches.at(-1)).toEqual(["a", null])
   })
 
+  test("enabling session auto-approve also clears waiting subagent requests", async () => {
+    const { store, replies, req, ask } = setup()
+    ask(req("per_child", "c"))
+    await store.setSessionAutoApprove("b", true)
+    expect(replies.map((r) => r[1])).toEqual(["per_child"])
+    await expect(store.setSessionAutoApprove("c", false)).rejects.toThrow("inherited from a parent")
+    expect(store.sessionAutoApproves("c")).toBe(true)
+  })
+
   test("a reload clears asks answered elsewhere while disconnected", async () => {
     const { store, req, ask } = setup()
     ask(req("per_1", "a"))
@@ -99,6 +108,7 @@ describe("permissions", () => {
       active: async () => new Set<string>(),
       permissions: async () => [],
       forms: async () => [],
+      pendingForms: async () => [],
     })
     await store.reload()
     await tick()

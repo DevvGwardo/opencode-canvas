@@ -86,7 +86,7 @@ export type Message =
     }
   | { type: "compaction"; id: string; time: { created: number }; [k: string]: any }
   | { type: "model-switched"; id: string; time: { created: number }; model?: ModelRef; [k: string]: any }
-  | { type: "agent-switched"; id: string; time: { created: number }; agent?: string; [k: string]: any }
+  | { type: "agent-switched"; id: string; time: { created: number }; agent?: string | { name?: string }; [k: string]: any }
   | {
       type: "synthetic" | "system" | "skill" | "idle" | "location-switched"
       id: string
@@ -132,6 +132,18 @@ export interface FormField {
   placeholder?: string
   default?: any
   options?: FormOption[]
+  /** Allow an answer outside the advertised choices. */
+  custom?: boolean
+  when?: Array<{ key: string; op: "eq" | "neq"; value: string | number | boolean }>
+  format?: "email" | "uri" | "date" | "date-time"
+  minLength?: number
+  maxLength?: number
+  pattern?: string
+  minimum?: number
+  maximum?: number
+  minItems?: number
+  maxItems?: number
+  url?: string
   [k: string]: any
 }
 

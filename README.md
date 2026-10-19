@@ -42,7 +42,7 @@ OpenCode Canvas is a local web application that displays every OpenCode v2 codin
 ### Canvas
 - **Infinite pan and zoom**: Pan smoothly by dragging or scrolling; zoom with pinch or Command/Ctrl + scroll. Camera motion includes momentum and elastic boundaries (overshoot tops out at 14% of the screen).
 - **Project grouping**: Sessions are arranged as cards grouped by project folder, with active work sorted to the top.
-- **Dynamic layouts**: Switch between Satellites, Fold, Tabs, and Tree layouts on the fly.
+- **Dynamic layouts**: Switch between Satellites, Fold, Tabs, Tree, and Agents layouts on the fly.
 - **Global search**: Press `/`, `Command+K`, or start typing anywhere to search across titles, project names, loaded previews, and OpenCode server-side session history. Cards reflow with motion blur.
 - **Performance**: DOM-based cards inside a single GPU-composited world layer, lazy preview loading for visible cards (4 concurrent requests), and viewport culling.
 - **Session creation**: Start new sessions from the global picker (`N`) with path autocompletion and model selection, or use the "+ New session" card at the end of each project.
@@ -78,7 +78,7 @@ OpenCode Canvas is a local web application that displays every OpenCode v2 codin
 - **Streaming transcripts**: Renders live thinking deltas, text streams, shell outputs, and tool operations.
 - **Turn tool folding**: Summarizes tool calls into a single expandable summary per turn (e.g. "Patched 7 files, ran 12 commands, read 2 files"); click to expand and review individual outputs.
 - **Steer and queue**: `Enter` sends immediately and steers a running agent mid-turn; `Tab` queues messages to execute after the current turn completes. Queued messages support "Send now" and "Cancel".
-- **Inline interaction**: Authorize permissions, answer questions, and submit forms without switching contexts.
+- **Inline interaction**: Authorize permissions, answer questions, and submit forms without switching contexts. Parent transcripts also show pending subagent prompts.
 - **Rich input**: Paste or drag-and-drop images directly into the composer.
 - **Model switching**: Switch models dynamically across all providers configured in OpenCode; chosen models persist for new sessions.
 - **Model effort**: Select the actual effort variants advertised by OpenCode (such as low, high, or max), independently of the model. The selection persists for new sessions.
@@ -92,6 +92,14 @@ OpenCode Canvas is a local web application that displays every OpenCode v2 codin
 - **Phone/desktop layouts**: Switch the remote viewport between narrow and desktop layouts. A new browser starts in phone layout on small screens.
 - **Isolated profile**: Chrome runs on demand in a temporary profile, never your personal Chrome profile. Streaming pauses when hidden; the browser closes after five minutes without viewers.
 - **Authenticated LAN access**: `--lan` requires a separate Canvas password, prints local-network URLs, and keeps OpenCode credentials on the host.
+
+### Questions
+
+Questions show the advertised choices and their descriptions, with an **Other** answer when OpenCode allows one. Select all required answers before submitting; Canvas supports multiple selections, numeric answers, and checkbox values.
+
+Conditional fields appear only when their conditions match. Advertised string, number, and selection limits are checked before submission. Free-text answers support multiple lines; custom multiselect answers use one answer per line, so commas are preserved.
+
+Answers stay editable after a failed request, with an inline error so you can retry. Controls pause during submission to prevent duplicate replies. External questions expose a safe HTTP(S) action link and must be completed externally or in OpenCode, or dismissed. Pending subagent questions appear in their parent's transcript as well as the subagent's own view. Canvas also discovers questions already waiting in idle sessions when it opens.
 
 ### Permissions
 - **Granular and batch controls**: Authorize individual prompts, set session-wide exemptions, or clear all pending requests at once.
@@ -171,15 +179,15 @@ You can also append `?demo=1` to the URL at any time.
 | `+` / `-` | Zoom in / Zoom out |
 | `0` or Double-click | Fit all sessions in view |
 | `Left` `Up` `Right` `Down` | Move selection between cards |
+| `Tab` | Move focus into the canvas at the selected card (arrows then move between cards); in a session or tile, queue the message for after the turn |
 | `Enter` | Open selected card or stack; in session/tile, send or steer |
-| `Tab` | In session or tile, queue message for after the turn |
 | `Shift` + `Enter` | Insert newline in message input |
 | `Esc` | Step back one level, close panel/picker/tiles, or clear filter/search |
 | `/` or `Command+K` or type | Focus global search |
 | `N` | Open new session picker (preselects focused card's project) |
 | `T` | Toggle Tiles view |
 | `B` | Toggle the integrated browser (outside a text input) |
-| `1` – `4` | Switch layout (`1` Satellites, `2` Fold, `3` Tabs, `4` Tree) |
+| `1` – `5` | Switch layout (`1` Satellites, `2` Fold, `3` Tabs, `4` Tree, `5` Agents) |
 | `]` / `[` | Jump to next / previous session needing attention |
 | `Command+.` | Stop running agent |
 | `?` | Toggle keyboard shortcuts overlay |
@@ -219,12 +227,13 @@ There is one shared browser per Canvas server, with up to four viewers. Everyone
   <em>The four spatial layout paradigms: Satellites, Fold, Tabs, and Tree.</em>
 </p>
 
-Select layouts using keys `1`–`4` or the layout switcher in the dock:
+Select layouts using keys `1`–`5` or the layout switcher in the dock:
 
 - **Satellites** (`1`): Projects are hubs centered on their latest session, with other sessions orbiting in concentric rings. Sessions with subagents carry a small orbit.
 - **Fold** (`2`): Projects collapse into compact stacks. Click a stack to fan out its sessions; press `Esc` to fold it back down.
 - **Tabs** (`3`): Projects are displayed as clean blocks organized in three-column grids.
 - **Tree** (`4`): Projects are arranged in vertical columns sorted by recent activity, wrapping into additional columns for large projects.
+- **Agents** (`5`): An agent tree that shows who started whom. Each session with subagents becomes an org chart: the session sits on top, its subagents fan out in a row below it, and deeper subagents stack indented under the agent that spawned them, joined by connectors coloured by status. Cards add a line with the agent, model, spend, and run time; the project heading shows the agent count and total cost. Click a card's subagent count to fold its branch away. Sessions without subagents pack into columns beside the trees.
 
 Working sessions across all layouts are marked with customizable dock spinner animations: Wave, Matrix, Braid, Mist, or Comet.
 
@@ -253,6 +262,8 @@ Configure execution boundaries according to your trust level:
 | Auto-approve | Top bar and Tiles bar (click, then click again to confirm) | Grants every permission request across all sessions in real time while the canvas is open (including sessions started in the TUI), and new sessions start with the allow-all rule. Displays approval toasts. |
 
 The new session picker also includes an **Auto-approve** checkbox to initialize new sessions with allow-all rules. Auto-approve permits agents to execute any command and modify any file without prompting.
+
+Subagents inherit Canvas auto-approve from their ancestors. Turn an inherited rule off in the parent session that owns it.
 
 ## Configuration
 
@@ -290,9 +301,9 @@ browser ──/api/*──▶ opencode-canvas (Bun) ──Basic auth──▶ Op
         ◀──SSE────                        ◀──/api/event──
 ```
 
-- **Server** (`src/server/`): Locates the service URL with `opencode service status`, loads the password from `~/.config/opencode/service.json`, and reverse-proxies `/api/*` endpoints with Basic authentication attached. The browser never receives the password; model settings, headers, and variant bodies are stripped from model metadata responses. SSE streams without buffering. Failed reads rediscover the service once; writes are never automatically retried because they may already have been accepted. Foreign origins, cross-site requests, and unapproved hosts receive 403. LAN access additionally requires a rate-limited password login with an HttpOnly, SameSite cookie; revoked logins lose access to existing streams.
+- **Server** (`src/server/`): Locates the service URL with `opencode service status`, loads the password from `~/.config/opencode/service.json`, and reverse-proxies `/api/*` endpoints with Basic authentication attached. The browser never receives the password; model settings, headers, and variant bodies are stripped from model metadata responses, including encoded and trailing-slash route aliases. SSE streams without buffering. Failed reads rediscover the service once; writes are never automatically retried because they may already have been accepted. Foreign origins, cross-site requests, and unapproved hosts receive 403. LAN access additionally requires a rate-limited password login with an HttpOnly, SameSite cookie; revoked logins lose access to existing streams.
 - **Browser** (`src/server/browser.ts`, `src/app/browser.ts`): Launches sandboxed Chrome/Chromium with a temporary profile and loopback-only debugging. JPEG viewport frames stream over authenticated SSE with frame throttling and backpressure; validated navigation/input actions travel through Canvas, never through an exposed debugging port. Hidden panels stop streaming, and an idle browser is shut down automatically.
-- **Store** (`src/app/store.ts`): Loads the most recent 600 sessions, active sessions (`/api/session/active`), and project lists on boot. Tracks real-time updates through `/api/event` (`session.execution.*`, `session.text.delta`, `session.tool.*`, `session.inbox.*`, `permission.*`, `form.*`). Card previews load lazily for visible cards (4 at a time). Full state resynchronizes automatically after reconnecting.
+- **Store** (`src/app/store.ts`): Loads the most recent 600 sessions, active sessions (`/api/session/active`), and project lists on boot. Tracks real-time updates through `/api/event` (`session.execution.*`, `session.text.delta`, `session.tool.*`, `session.inbox.*`, `permission.*`, `form.*`). Card previews load lazily for visible cards (4 at a time), with delayed retries after transient failures. Pending prompts resynchronize every 15 seconds and when opened, without discarding them on network errors. Full state resynchronizes automatically after reconnecting.
 - **Canvas** (`src/app/canvas.ts`, `camera.ts`, `layouts.ts`): Renders DOM cards inside a transformed world layer. Layouts are computed as pure functions, movements follow critically damped springs, off-screen cards are culled, and text re-rasterizes sharply once camera motion settles.
 - **Transcript** (`src/app/transcript.ts`): Shared by the open-session panel (`panel.ts`) and every tile (`tiles.ts`). Applies streaming events directly to the transcript (reasoning deltas, text deltas, tool lifecycle phases) and reconciles with `GET /message` after each step.
 
@@ -318,12 +329,14 @@ browser ──/api/*──▶ opencode-canvas (Bun) ──Basic auth──▶ Op
 - `session.form.list`
 - `session.form.reply`
 - `session.form.cancel`
+- `form.list` (discover pending questions by project location)
 - `project.list`
 - `model.list`
 - `model.default`
 - `command.list` (project-specific slash command discovery)
 - `fs.list` (folder autocomplete in the new session picker)
 - `event.subscribe`
+- `info` (server version shown in `/canvas/config`)
 
 The complete API specification is available at `GET /openapi.json` on your OpenCode server.
 

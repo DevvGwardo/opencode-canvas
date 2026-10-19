@@ -11,6 +11,8 @@ describe("browser input", () => {
     expect(() => browserUrl("file:///etc/passwd")).toThrow()
     expect(() => browserUrl("javascript:alert(1)")).toThrow()
     expect(() => browserUrl("http://user:password@example.com")).toThrow("without embedded credentials")
+    // Malformed URLs report the intended error instead of a raw TypeError.
+    expect(() => browserUrl("http://[::1")).toThrow("valid HTTP(S) URL")
   })
 
   test("accepts bounded inputs and rejects arbitrary CDP or invalid coordinates", () => {

@@ -106,8 +106,10 @@ export class SlashCommands {
     }
   }
 
-  open() {
-    this.input.value = "/"
+  /** `reset` seeds a fresh "/" (the /help flow); otherwise a typed draft is kept. */
+  open(reset = false) {
+    // Never discard a half-written draft just because the "/" button was clicked.
+    if (reset || !this.input.value.trim()) this.input.value = "/"
     this.dismissed = false
     this.input.focus()
     this.update()

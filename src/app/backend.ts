@@ -50,6 +50,7 @@ export interface Backend {
   inbox(id: string): Promise<InboxItem[]>
   permissions(id: string): Promise<PermissionRequest[]>
   forms(id: string): Promise<FormInfo[]>
+  pendingForms(directory: string): Promise<FormInfo[]>
   createSession(directory: string, model?: ModelRef, permissions?: PermissionRule[]): Promise<Session>
   setSessionPermissions(id: string, rules: PermissionRule[] | null): Promise<void>
   listModels(directory?: string): Promise<ModelOption[]>
@@ -83,11 +84,18 @@ export class ApiError extends Error {
   }
 }
 
+/** Give up on a single proxy request after this long (SSE is separate). */
+export const REQUEST_TIMEOUT_MS = 120_000
+
 async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
   const res = await fetch(path, {
     method,
     headers: body === undefined ? undefined : { "content-type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
+    // A hung OpenCode server must not leave spinners pending forever. The
+    // window is generous: a slow command or compaction still finishes, but a
+    // dead connection eventually surfaces as a clear error.
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   })
   const text = await res.text()
   let json: any
@@ -162,6 +170,10 @@ export class LiveBackend implements Backend {
 
   async forms(id: string) {
     return unwrap(await request<{ data: FormInfo[] }>("GET", `/api/session/${enc(id)}/form`)) ?? []
+  }
+
+  async pendingForms(directory: string) {
+    return unwrap(await request<{ data: FormInfo[] }>("GET", "/api/form" + locationQuery(directory))) ?? []
   }
 
   async createSession(directory: string, model?: ModelRef, permissions?: PermissionRule[]) {

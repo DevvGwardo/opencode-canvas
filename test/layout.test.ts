@@ -78,4 +78,73 @@ describe("layouts", () => {
     expect(r.labels[0].text).toMatch(/results?$/)
     for (const [, p] of hits) expect(p.x % (CARD_W + 14)).toBe(0)
   })
+
+  describe("agents", () => {
+    // root → a, b, c; a → a1, a2; a1 → a1x. Plus two sessions without subagents.
+    const team: LayoutGroup[] = [
+      {
+        key: "g",
+        label: "web",
+        items: [
+          { id: "root", kind: "session", h: 160, updated: 9, cost: 1 },
+          { id: "a", kind: "session", h: 150, updated: 8, parent: "root", cost: 0.25 },
+          { id: "a1", kind: "session", h: 140, updated: 7, parent: "a" },
+          { id: "a1x", kind: "session", h: 140, updated: 7, parent: "a1" },
+          { id: "a2", kind: "session", h: 140, updated: 6, parent: "a" },
+          { id: "b", kind: "session", h: 150, updated: 5, parent: "root" },
+          { id: "c", kind: "session", h: 170, updated: 4, parent: "root" },
+          { id: "solo1", kind: "session", h: 150, updated: 3 },
+          { id: "solo2", kind: "session", h: 150, updated: 2 },
+          { id: "new:g", kind: "new", h: 104, updated: 0 },
+        ],
+      },
+    ]
+
+    test("root on top, children in a row, grandchildren stacked and indented", () => {
+      const r = layout("agents", team, {})
+      const p = (id: string) => r.cards.get(id)!
+      expect(p("a").y).toBe(p("b").y)
+      expect(p("b").y).toBe(p("c").y)
+      expect(p("a").y).toBeGreaterThan(p("root").y + p("root").h)
+      expect(p("a").x).toBeLessThan(p("b").x)
+      expect(p("b").x).toBeLessThan(p("c").x)
+      expect(p("a1").x).toBeGreaterThan(p("a").x)
+      expect(p("a1x").x).toBeGreaterThan(p("a1").x)
+      expect(p("a2").x).toBe(p("a1").x)
+      expect(p("a1x").y).toBeGreaterThan(p("a1").y + p("a1").h)
+      expect(p("a2").y).toBeGreaterThan(p("a1x").y + p("a1x").h)
+      // The root is centred over its children.
+      expect(p("root").x + CARD_W / 2).toBeCloseTo((p("a").x + p("c").x + CARD_W) / 2, 0)
+      expect(r.labels[0].sub).toBe("9 agents · $1.25")
+    })
+
+    test("visible cards never overlap and every edge gets a link", () => {
+      const r = layout("agents", team, {})
+      const shown = [...r.cards.values()].filter((p) => p.opacity > 0)
+      expect(shown.length).toBe(team[0].items.length)
+      for (let i = 0; i < shown.length; i++)
+        for (let j = i + 1; j < shown.length; j++) expect(overlaps(shown[i], shown[j])).toBe(false)
+      expect(r.links.map((l) => `${l.from}>${l.to}`).sort()).toEqual(["a1>a1x", "a>a1", "a>a2", "root>a", "root>b", "root>c"])
+    })
+
+    test("collapsing hides the whole branch behind its parent", () => {
+      const r = layout("agents", team, { collapsed: new Set(["a"]) })
+      for (const id of ["a1", "a1x", "a2"]) {
+        expect(r.cards.get(id)!.opacity).toBe(0)
+        expect(r.cards.get(id)!.interactive).toBe(false)
+        expect(r.cards.get(id)!.x).toBe(r.cards.get("a")!.x)
+      }
+      expect(r.links.some((l) => l.from === "a" || l.from === "a1")).toBe(false)
+      expect(r.cards.get("b")!.opacity).toBe(1)
+    })
+
+    test("other layouts tuck subagents behind their root", () => {
+      for (const name of LAYOUTS.filter((n) => n !== "agents")) {
+        const r = layout(name, team, {})
+        expect(r.links.length).toBe(0)
+        for (const id of ["a", "a1x", "c"]) expect(r.cards.get(id)!.opacity).toBe(0)
+        expect(r.cards.get("a1x")!.x).toBe(r.cards.get("root")!.x)
+      }
+    })
+  })
 })

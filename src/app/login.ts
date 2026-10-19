@@ -37,8 +37,15 @@ export async function ensureAccess(root: HTMLElement): Promise<boolean> {
         })
         input.value = ""
         if (!login.ok) {
-          const body = await login.json()
-          throw new Error(body.message ?? `Sign in failed (${login.status})`)
+          // A reverse proxy answers with an HTML error page; only a JSON body
+          // carries a message worth showing.
+          const text = await login.text()
+          let message: string | undefined
+          try {
+            const body = JSON.parse(text) as { message?: unknown }
+            message = typeof body?.message === "string" && body.message ? body.message : undefined
+          } catch { /* not JSON */ }
+          throw new Error(message ?? `Sign in failed (${login.status})`)
         }
         box.remove()
         resolve(true)

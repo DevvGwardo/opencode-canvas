@@ -50,10 +50,11 @@ export class SessionPanel {
   tiles?: { isPinned(id: string): boolean; togglePin(id: string): void }
   private attachments: Array<{ uri: string; name: string }> = []
   private closing = false
+  private closeTimer?: ReturnType<typeof setTimeout>
   private statusState = ""
 
   constructor(
-    private host: HTMLElement,
+    host: HTMLElement,
     private store: Store,
     private backend: Backend,
     private canvas: CanvasView,
@@ -107,8 +108,10 @@ export class SessionPanel {
     this.header.append(left, right)
 
     this.titleEl = h("h1", "panel-title")
+    this.titleEl.id = "panel-title"
     this.titleEl.title = "Double-click to rename"
     this.titleEl.addEventListener("dblclick", () => this.beginRename())
+    this.el.setAttribute("aria-labelledby", this.titleEl.id)
     this.line = h("div", "panel-line")
 
     this.transcript = new Transcript(store, backend, {
@@ -167,7 +170,7 @@ export class SessionPanel {
     const vh = innerHeight
     const browser = document.querySelector<HTMLElement>(".browser-panel.visible:not(.expanded)")
     const available = browser && vw >= 1000 ? browser.getBoundingClientRect().left - 8 : vw
-    const w = Math.min(860, available - 32)
+    const w = Math.max(280, Math.min(860, available - 32))
     const top = vw < 640 ? 12 : 24
     const bottom = vw < 640 ? 64 : 74
     return new DOMRect((available - w) / 2, top, w, vh - top - bottom)
@@ -187,6 +190,9 @@ export class SessionPanel {
     if (this.id === id && this.isOpen) return this.focusInput()
     const switching = this.isOpen
     if (this.id && this.id !== id) this.saveDraft()
+    clearTimeout(this.closeTimer)
+    this.closeTimer = undefined
+    this.el.classList.remove("leaving")
     this.id = id
     this.closing = false
     const draft = this.drafts.get(id)
@@ -214,7 +220,7 @@ export class SessionPanel {
     }
     this.transcript.setSession(id)
     setTimeout(() => {
-      if (this.id === id && !matchMedia("(pointer: coarse)").matches) this.input.focus({ preventScroll: true })
+      if (this.id === id && !this.closing && !matchMedia("(pointer: coarse)").matches) this.input.focus({ preventScroll: true })
     }, switching ? 0 : 260)
   }
 
@@ -232,6 +238,7 @@ export class SessionPanel {
     if (rect) this.applyGeometry(rect, true)
     const done = () => {
       if (!this.closing) return
+      this.closeTimer = undefined
       this.el.classList.remove("visible", "leaving", "animating")
       this.canvas.setOpen(undefined)
       this.id = undefined
@@ -239,7 +246,7 @@ export class SessionPanel {
       this.closing = false
       this.onClosed()
     }
-    setTimeout(done, rect ? 380 : 120)
+    this.closeTimer = setTimeout(done, rect ? 380 : 120)
   }
 
   // ---- rendering ----------------------------------------------------------------
@@ -252,17 +259,15 @@ export class SessionPanel {
     this.projectEl.title = s.location.directory
     const working = this.store.running.has(id)
     const ask = this.store.needsInput(id)
-    const state = ask ? `ask:${ask}` : working ? "working" : "idle"
+    const st = s.outcome === "failed" ? "failed" : s.outcome === "interrupted" ? "stopped" : "done"
+    const state = ask ? `ask:${ask}` : working ? "working" : `idle:${st}`
     if (state !== this.statusState) {
       this.statusState = state
       this.statusEl.replaceChildren()
       if (ask) this.statusEl.append(h("span", "mark needs-you"), h("span", "label", ask === "permission" ? "Needs permission" : "Waiting for your answer"))
       else if (working) this.statusEl.append(spinner(13), h("span", "label"))
-      else {
-        const st = s.outcome === "failed" ? "failed" : s.outcome === "interrupted" ? "stopped" : "done"
-        this.statusEl.append(h("span", `mark ${st}`), h("span", "label"))
-      }
-      this.el.dataset.status = ask ? "needs-you" : working ? "working" : (s.outcome ?? "done")
+      else this.statusEl.append(h("span", `mark ${st}`), h("span", "label"))
+      this.el.dataset.status = ask ? "needs-you" : working ? "working" : st
     }
     const label = this.statusEl.querySelector(".label")
     if (label && !ask)
@@ -389,6 +394,7 @@ export class SessionPanel {
     const pop = h("div", "popover models")
     const filter = h("input", "pop-filter") as HTMLInputElement
     filter.placeholder = "Search models"
+    filter.setAttribute("aria-label", "Search models")
     filter.spellcheck = false
     const list = h("div", "pop-list")
     pop.append(filter, list)
@@ -606,11 +612,15 @@ export class SessionPanel {
         reader.readAsDataURL(f)
       }
     })
-    this.el.addEventListener("dragover", (e) => e.preventDefault())
+    this.el.addEventListener("dragover", (e) => {
+      if (e.dataTransfer?.types.includes("Files")) e.preventDefault()
+    })
     this.el.addEventListener("drop", (e) => {
+      // Always stop the default: dropping a non-image file would otherwise make
+      // the browser navigate away from the app and lose unsaved state.
+      e.preventDefault()
       const files = [...(e.dataTransfer?.files ?? [])].filter((f) => f.type.startsWith("image/"))
       if (!files.length) return
-      e.preventDefault()
       for (const f of files) {
         if (f.size > 8 * 1024 * 1024) {
           toast("Images must be smaller than 8 MB")
@@ -656,7 +666,7 @@ export class SessionPanel {
     if (command && CANVAS_COMMANDS.some((c) => c.name === command.name)) {
       try {
         await runCanvasCommand(text, {
-          help: () => this.slash.open(),
+          help: () => this.slash.open(true),
           model: () => this.showModelPicker(),
           effort: (variant) => variant ? this.changeEffort(variant) : this.showEffortPicker(),
           compact: async () => { await this.backend.compact(id, delivery); this.transcript.scheduleRefetch(80) },

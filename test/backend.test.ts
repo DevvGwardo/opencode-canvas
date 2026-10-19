@@ -19,6 +19,7 @@ describe("OpenCode backend", () => {
     await backend.listModels("/code/a b")
     await backend.listCommands("/code/a b")
     await backend.serverDefaultModel("/code/a b")
+    await backend.pendingForms("/code/a b")
     for (const path of paths) {
       const url = new URL(path, "http://localhost")
       expect(url.searchParams.get("location[directory]")).toBe("/code/a b")
@@ -57,5 +58,16 @@ describe("OpenCode backend", () => {
     })
     await new LiveBackend().listSessions(600)
     expect(count).toBe(2)
+  })
+
+  test("bounds every proxy request with a timeout so a hung server can't hang the UI", async () => {
+    let signal: AbortSignal | undefined
+    stubFetch(async (_input: any, init?: RequestInit) => {
+      signal = init?.signal ?? undefined
+      return Response.json({ data: [] })
+    })
+    await new LiveBackend().listProjects()
+    expect(signal).toBeInstanceOf(AbortSignal)
+    expect(signal!.aborted).toBe(false)
   })
 })

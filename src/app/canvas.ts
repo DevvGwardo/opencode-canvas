@@ -13,6 +13,7 @@ import {
   type LayoutResult,
   type Placement,
 } from "./layouts"
+import type { Session } from "./types"
 import { STATUS_LABEL, type Status, type Store } from "./store"
 
 interface Spring {
@@ -40,6 +41,8 @@ interface CardView {
   settled: boolean
   culled: boolean
   blur: number
+  /** Newly added or just re-laid-out: enter from the target, not the old spot. */
+  fresh: boolean
 }
 
 export interface CanvasHandlers {
@@ -84,6 +87,10 @@ export class CanvasView {
   readonly stage: HTMLElement
   readonly world: HTMLElement
   private labelsLayer: HTMLElement
+  private linksLayer: SVGSVGElement
+  private linksKey = ""
+  /** Agents layout: sessions whose subagents are folded away. */
+  private collapsed = new Set<string>()
   private cards = new Map<string, CardView>()
   private labels = new Map<string, HTMLElement>()
   private result?: LayoutResult
@@ -92,6 +99,8 @@ export class CanvasView {
   private expanded?: string
   private needsLayout = true
   private firstLayout = true
+  /** Fit the camera to the map once the next layout finishes. */
+  private fitAfterLayout = false
   private heightsDirty = new Set<string>()
   private frameScheduled = false
   private lastFrame = performance.now()
@@ -99,6 +108,7 @@ export class CanvasView {
   private lastPreviewScan = 0
   private openId?: string
   private accentH = 0
+  private tabStopsDirty = false
   selected?: string
 
   constructor(
@@ -112,7 +122,10 @@ export class CanvasView {
     this.world.className = "world"
     this.labelsLayer = document.createElement("div")
     this.labelsLayer.className = "labels"
-    this.world.append(this.labelsLayer)
+    this.linksLayer = document.createElementNS("http://www.w3.org/2000/svg", "svg")
+    this.linksLayer.classList.add("links")
+    this.linksLayer.setAttribute("aria-hidden", "true")
+    this.world.append(this.linksLayer, this.labelsLayer)
     this.stage.append(this.world)
     host.append(this.stage)
 
@@ -146,6 +159,8 @@ export class CanvasView {
     this.layoutName = name
     this.expanded = undefined
     this.host.dataset.layout = name
+    // Card meta lines show only in some layouts, so every height may change.
+    for (const id of this.cards.keys()) this.heightsDirty.add(id)
     this.relayout(true)
   }
 
@@ -171,9 +186,11 @@ export class CanvasView {
     this.query = next
     this.remoteHits = new Set()
     this.relayout(!was || !next)
+    // Bump even when clearing: otherwise an in-flight server search resolves
+    // after the box is emptied and injects sessions / moves the camera.
+    const seq = ++this.remoteSeq
     if (!next) return
     // The server also searches content we haven't loaded into previews yet.
-    const seq = ++this.remoteSeq
     this.store.backend
       .searchSessions(next)
       .then((found) => {
@@ -195,9 +212,13 @@ export class CanvasView {
     if (!this.expanded) return false
     const g = this.expanded
     this.expanded = undefined
-    this.relayout(false)
+    // Lay out synchronously: relayout() is async, so fitting against this.result
+    // here would frame the still-expanded columns instead of the collapsed pile.
+    this.needsLayout = true
+    this.doLayout()
     const r = this.result?.groups.get(g)
     if (r) this.camera.fit(r, 120, Math.min(1, this.camera.z))
+    this.kick()
     return true
   }
 
@@ -206,6 +227,9 @@ export class CanvasView {
     this.openId = id
     this.host.classList.toggle("dimmed", !!id)
     if (id) this.cards.get(id)?.root.classList.add("is-open")
+    // An open card is hidden (visibility) behind the panel: it must not be the
+    // roving tab stop, or Tab lands on an invisible element.
+    this.applyTabStops()
   }
 
   /** Screen rect of a card as currently displayed. */
@@ -248,13 +272,34 @@ export class CanvasView {
 
   private groupsCache: ReturnType<Store["groups"]> = []
 
+  /** Every subagent under a session, depth first, oldest first at each level. */
+  private descendants(id: string, out: Session[] = [], seen = new Set<string>([id])): Session[] {
+    const kids = [...(this.store.children.get(id) ?? [])]
+      .map((k) => this.store.sessions.get(k))
+      .filter((k): k is Session => !!k && !k.time.archived && !seen.has(k.id))
+      .sort((a, b) => a.time.created - b.time.created)
+    for (const k of kids) {
+      seen.add(k.id)
+      out.push(k)
+      this.descendants(k.id, out, seen)
+    }
+    return out
+  }
+
+  toggleCollapsed(id: string) {
+    if (this.collapsed.has(id)) this.collapsed.delete(id)
+    else this.collapsed.add(id)
+    this.cards.get(id)?.root.classList.toggle("collapsed", this.collapsed.has(id))
+    this.relayout(false)
+  }
+
   private sync() {
     const groups = this.store.groups()
     this.groupsCache = groups
     const seen = new Set<string>()
     let added = 0
     for (const g of groups) {
-      for (const s of g.sessions) {
+      for (const s of g.sessions.flatMap((r) => [r, ...this.descendants(r.id)])) {
         seen.add(s.id)
         let c = this.cards.get(s.id)
         if (!c) {
@@ -281,6 +326,7 @@ export class CanvasView {
       if (this.selected === id) this.selected = undefined
     }
     this.updateCards(new Set(this.cards.keys()))
+    this.applyTabStops()
     this.relayout(added > 0 && !!this.query)
   }
 
@@ -296,8 +342,8 @@ export class CanvasView {
       settled: false,
       culled: false,
       blur: 0,
+      fresh: true,
     }
-    ;(c as any).fresh = true
     this.world.append(root)
     this.cards.set(id, c)
     return c
@@ -338,25 +384,30 @@ export class CanvasView {
 
   private relayout(fitCamera: boolean) {
     this.needsLayout = true
-    ;(this as any).fitAfterLayout = fitCamera || (this as any).fitAfterLayout
+    this.fitAfterLayout = fitCamera || this.fitAfterLayout
     this.kick()
   }
 
   private doLayout() {
     this.needsLayout = false
-    const groups: LayoutGroup[] = this.groupsCache.map((g) => ({
-      key: g.key,
-      label: g.label,
-      items: [
-        ...g.sessions.map((s) => ({
-          id: s.id,
-          kind: "session" as const,
-          h: this.cards.get(s.id)?.h ?? 180,
-          updated: this.store.isWorking(s.id) ? Date.now() : s.time.updated,
-        })),
-        { id: `new:${g.key}`, kind: "new" as const, h: NEW_CARD_H, updated: 0 },
-      ],
-    }))
+    const groups: LayoutGroup[] = this.groupsCache.map((g) => {
+      const roots = new Set(g.sessions.map((r) => r.id))
+      return {
+        key: g.key,
+        label: g.label,
+        items: [
+          ...g.sessions.flatMap((r) => [r, ...this.descendants(r.id)]).map((s) => ({
+            id: s.id,
+            kind: "session" as const,
+            h: this.cards.get(s.id)?.h ?? 180,
+            updated: this.store.isWorking(s.id) ? Date.now() : s.time.updated,
+            parent: roots.has(s.id) ? undefined : s.parentID,
+            cost: s.cost,
+          })),
+          { id: `new:${g.key}`, kind: "new" as const, h: NEW_CARD_H, updated: 0 },
+        ],
+      }
+    })
     const q = this.query
     const f = this.statusFilter
     const t = Date.now()
@@ -375,7 +426,7 @@ export class CanvasView {
       : undefined
     const prev = this.result
     const aspect = Math.min(3, Math.max(0.5, this.camera.viewport.w / Math.max(1, this.camera.viewport.h)))
-    this.result = layout(this.layoutName, groups, { expanded: this.expanded, query, aspect, resultLabel }, prev)
+    this.result = layout(this.layoutName, groups, { expanded: this.expanded, query, aspect, resultLabel, collapsed: this.collapsed }, prev)
 
     for (const [id, c] of this.cards) {
       const t = this.result.cards.get(id)
@@ -383,8 +434,8 @@ export class CanvasView {
       c.target = t
       c.root.style.zIndex = String(t.z)
       c.root.classList.toggle("inert", !t.interactive)
-      if ((c as any).fresh || this.firstLayout) {
-        ;(c as any).fresh = false
+      if (c.fresh || this.firstLayout) {
+        c.fresh = false
         c.sp.x = t.x
         c.sp.y = t.y
         c.sp.r = t.rot
@@ -398,17 +449,19 @@ export class CanvasView {
       }
       c.settled = false
     }
+    this.applyTabStops()
     this.renderLabels()
+    this.renderLinks()
     this.camera.setBounds(this.result.bounds)
 
     if (this.firstLayout && this.groupsCache.length) {
       this.firstLayout = false
       this.initialCamera()
-    } else if ((this as any).fitAfterLayout) {
+    } else if (this.fitAfterLayout) {
       const b = this.query ? (this.result.groups.get("__search") ?? this.result.bounds) : this.result.bounds
       this.camera.fit(b, 72, 1)
     }
-    ;(this as any).fitAfterLayout = false
+    this.fitAfterLayout = false
     this.cameraDirty = true
   }
 
@@ -455,13 +508,43 @@ export class CanvasView {
     }
   }
 
+  /** Elbow connectors from each agent to the subagents it started. */
+  private renderLinks() {
+    const links = this.result!.links
+    const status = (id: string) => this.cards.get(id)?.root.dataset.status ?? "done"
+    const key = links.map((l) => `${l.d}|${status(l.to)}`).join(";")
+    if (key === this.linksKey) return
+    this.linksKey = key
+    const ns = "http://www.w3.org/2000/svg"
+    const dots = new Map<string, [number, number]>()
+    const nodes: SVGElement[] = []
+    for (const l of links) {
+      const p = document.createElementNS(ns, "path")
+      p.setAttribute("d", l.d)
+      p.setAttribute("class", `link st-${status(l.to)}`)
+      nodes.push(p)
+      dots.set(`${l.dot[0]},${l.dot[1]}`, l.dot)
+    }
+    for (const [x, y] of dots.values()) {
+      const c = document.createElementNS(ns, "circle")
+      c.setAttribute("cx", String(x))
+      c.setAttribute("cy", String(y))
+      c.setAttribute("r", "3.5")
+      c.setAttribute("class", "link-dot")
+      nodes.push(c)
+    }
+    this.linksLayer.replaceChildren(...nodes)
+  }
+
   /** "● 2 working  ● 1 needs you" beside a project name. */
   private renderLabelMarks(host: Element, groupKey: string) {
     const g = this.groupsCache.find((x) => x.key === groupKey)
     const counts = { "needs-you": 0, working: 0, review: 0 }
     if (g) {
       const t = Date.now()
-      for (const s of g.sessions) {
+      // The agents layout counts every agent on screen, not just the roots.
+      const all = this.layoutName === "agents" ? g.sessions.flatMap((r) => [r, ...this.descendants(r.id)]) : g.sessions
+      for (const s of all) {
         if (this.store.inFilter(s.id, "needs-you", t)) counts["needs-you"]++
         else if (this.store.inFilter(s.id, "working", t)) counts.working++
         else if (this.store.inFilter(s.id, "review", t)) counts.review++
@@ -555,11 +638,18 @@ export class CanvasView {
         if (inView === c.culled) {
           c.culled = !inView
           c.root.classList.toggle("culled", c.culled)
+          // When the selected card leaves the viewport it can no longer hold the
+          // roving tab stop; only then is a relayout of tab stops worthwhile.
+          if (c.id === this.selected) this.tabStopsDirty = true
         }
       }
       if (scanPreviews && !c.culled && c.kind === "session") this.store.wantPreview(c.id)
     }
 
+    if (this.tabStopsDirty) {
+      this.tabStopsDirty = false
+      this.applyTabStops()
+    }
     if (active || this.needsLayout || this.heightsDirty.size) this.kick()
   }
 
@@ -567,15 +657,19 @@ export class CanvasView {
 
   private bindInput() {
     const stage = this.stage
+    // Safari trackpad pinch fires both gesture* events and synthetic ctrl-wheel
+    // events for the same gesture; prefer the gesture events so one pinch doesn't
+    // apply the zoom twice.
+    let lastGesture = 0
     stage.addEventListener(
       "wheel",
       (e) => {
         e.preventDefault()
         const k = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? innerHeight : 1
         const r = stage.getBoundingClientRect()
-        if (e.ctrlKey || e.metaKey) {
+        if ((e.ctrlKey || e.metaKey) && performance.now() - lastGesture > 250) {
           this.camera.zoomAt(Math.exp(-e.deltaY * k * 0.0105), e.clientX - r.left, e.clientY - r.top)
-        } else {
+        } else if (!e.ctrlKey && !e.metaKey) {
           this.camera.panBy(e.deltaX * k, e.deltaY * k)
         }
       },
@@ -587,9 +681,11 @@ export class CanvasView {
     stage.addEventListener("gesturestart", (e: any) => {
       e.preventDefault()
       gestureScale = 1
+      lastGesture = performance.now()
     })
     stage.addEventListener("gesturechange", (e: any) => {
       e.preventDefault()
+      lastGesture = performance.now()
       const r = stage.getBoundingClientRect()
       this.camera.zoomAt(e.scale / gestureScale, e.clientX - r.left, e.clientY - r.top)
       gestureScale = e.scale
@@ -677,7 +773,10 @@ export class CanvasView {
       }
       if (e.type === "pointercancel") return
       const target = (e.target as HTMLElement).closest<HTMLElement>(".card")
-      if (target && !target.classList.contains("inert")) this.activate(target.dataset.id!)
+      const fold = (e.target as HTMLElement).closest(".card-sub")
+      if (target && fold && this.layoutName === "agents" && !this.query && target.classList.contains("has-sub"))
+        this.toggleCollapsed(target.dataset.id!)
+      else if (target && !target.classList.contains("inert")) this.activate(target.dataset.id!)
       else {
         const lbl = (e.target as HTMLElement).closest<HTMLElement>(".group-label")
         if (lbl?.dataset.group && this.layoutName === "fold" && !this.query) this.openStack(lbl.dataset.group)
@@ -689,6 +788,22 @@ export class CanvasView {
     stage.addEventListener("dblclick", (e) => {
       if ((e.target as HTMLElement).closest(".card")) return
       this.fitAll()
+    })
+
+    // Roving tabindex: Tab reaches the canvas once (at the selected card)
+    // instead of once per session, and the arrow keys move within it. A focused
+    // card activates with Enter or Space, like a real button.
+    stage.addEventListener("focusin", (e) => {
+      const id = (e.target as HTMLElement | null)?.closest?.<HTMLElement>(".card")?.dataset.id
+      if (id && id !== this.selected) this.select(id, false)
+    })
+    stage.addEventListener("keydown", (e) => {
+      if (e.key !== "Enter" && e.key !== " " && e.key !== "Spacebar") return
+      const id = (e.target as HTMLElement | null)?.closest?.<HTMLElement>(".card")?.dataset.id
+      if (!id) return
+      e.preventDefault()
+      e.stopPropagation()
+      this.activate(id)
     })
   }
 
@@ -712,11 +827,12 @@ export class CanvasView {
 
   // ---- selection / keyboard ---------------------------------------------------
 
-  select(id: string | undefined, reveal = true) {
+  select(id: string | undefined, reveal = true, focus = false) {
     if (this.selected) this.cards.get(this.selected)?.root.classList.remove("selected")
     this.selected = id
     const c = id ? this.cards.get(id) : undefined
     c?.root.classList.add("selected")
+    this.applyTabStops()
     this.handlers.selectionChanged?.(id)
     if (c && reveal && c.target) {
       const t = c.target
@@ -724,11 +840,50 @@ export class CanvasView {
       const inside = t.x >= vis.x && t.y >= vis.y && t.x + CARD_W <= vis.x + vis.w && t.y + c.h <= vis.y + vis.h
       if (!inside) this.camera.animateTo(t.x + CARD_W / 2, t.y + c.h / 2, Math.max(this.camera.z, 0.75), 380)
     }
+    if (c && focus) c.root.focus({ preventScroll: true })
+  }
+
+  /**
+   * Keep exactly one card in the tab order (the roving tabindex). Without a
+   * selection, the first reachable card is the entry point so Tab can still
+   * bring keyboard users into the canvas.
+   */
+  private applyTabStops() {
+    let stop: string | undefined
+    // A card hidden by culling or by the open panel is still focusable, so it
+    // must never be the single tab stop.
+    const usable = (c: CardView) =>
+      !c.root.classList.contains("inert") &&
+      !c.root.classList.contains("is-open") &&
+      !c.culled
+    const preferred = this.selected ? this.cards.get(this.selected) : undefined
+    if (preferred && usable(preferred)) stop = this.selected
+    if (!stop)
+      for (const [id, c] of this.cards)
+        if (usable(c)) {
+          stop = id
+          break
+        }
+    // If everything is hidden, fall back to any non-inert card so Tab still has
+    // an entry point into the canvas.
+    if (!stop)
+      for (const [id, c] of this.cards)
+        if (!c.root.classList.contains("inert")) {
+          stop = id
+          break
+        }
+    for (const [id, c] of this.cards) {
+      const want = id === stop ? 0 : -1
+      if (c.root.tabIndex !== want) c.root.tabIndex = want
+    }
   }
 
   moveSelection(dx: number, dy: number) {
     const candidates = [...this.cards.values()].filter((c) => c.target?.interactive && (c.target?.opacity ?? 0) > 0.5)
     if (!candidates.length) return
+    // Move DOM focus with the selection when the keys came from the canvas, so
+    // screen readers announce the card the arrows land on.
+    const keyboard = this.stage.contains(document.activeElement)
     const center = (c: CardView) => ({ x: c.target!.x + CARD_W / 2, y: c.target!.y + c.h / 2 })
     const cur = this.selected ? this.cards.get(this.selected) : undefined
     if (!cur?.target) {
@@ -738,7 +893,7 @@ export class CanvasView {
         const db = Math.hypot(center(b).x - mid.x, center(b).y - mid.y)
         return db < da ? b : a
       })
-      return this.select(best.id)
+      return this.select(best.id, true, keyboard)
     }
     const o = center(cur)
     let best: CardView | undefined
@@ -757,7 +912,7 @@ export class CanvasView {
         best = c
       }
     }
-    if (best) this.select(best.id)
+    if (best) this.select(best.id, true, keyboard)
   }
 
   visibleBounds(): Rect {

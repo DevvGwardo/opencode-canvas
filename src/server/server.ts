@@ -49,23 +49,34 @@ export async function startServer(opts: ServerOptions) {
     console.log(`  ${new Date().toLocaleTimeString()}  ${line}`)
   }
 
+  let resolveToken = 0
   async function getUpstream(force = false): Promise<Upstream | undefined> {
     if (opts.demo) return undefined
     if (upstream && !force) return upstream
-    resolving ??= resolveUpstream(opts)
-      .then((u) => {
-        upstream = u
-        upstreamError = undefined
-        return u
-      })
-      .catch((e: Error) => {
-        upstreamError = e.message
-        logState(`opencode  \x1b[31munavailable\x1b[0m  ${e.message}`)
-        return undefined
-      })
-      .finally(() => {
-        resolving = undefined
-      })
+    // A forced rediscovery (after a lost connection) must not reuse an older
+    // in-flight resolve, or it just hands back the same dead upstream. The token
+    // keeps a superseded resolve from clobbering the newest result.
+    if (!resolving || force) {
+      const token = ++resolveToken
+      resolving = resolveUpstream(opts)
+        .then((u) => {
+          if (token === resolveToken) {
+            upstream = u
+            upstreamError = undefined
+          }
+          return u
+        })
+        .catch((e: Error) => {
+          if (token === resolveToken) {
+            upstreamError = e.message
+            logState(`opencode  \x1b[31munavailable\x1b[0m  ${e.message}`)
+          }
+          return undefined
+        })
+        .finally(() => {
+          if (token === resolveToken) resolving = undefined
+        })
+    }
     return resolving
   }
 
@@ -114,7 +125,14 @@ export async function startServer(opts: ServerOptions) {
     const blocked = access.guard(req)
     if (blocked) return blocked
 
-    const isStream = url.pathname === "/api/event"
+    let path: string
+    try {
+      // OpenCode accepts percent-encoded route names and trailing slashes.
+      path = decodeURIComponent(url.pathname).replace(/\/+$/, "")
+    } catch {
+      return Response.json({ message: "Invalid API path" }, { status: 400 })
+    }
+    const isStream = path === "/api/event"
     if (isStream) server.timeout(req, 0)
 
     const body = req.method === "GET" || req.method === "HEAD" ? undefined : await req.arrayBuffer()
@@ -134,12 +152,15 @@ export async function startServer(opts: ServerOptions) {
       const auth = authHeader(up)
       if (auth) headers.set("authorization", auth)
       if (isStream) headers.set("accept-encoding", "identity")
+      // Bound non-stream requests: a hung upstream must not pin the connection
+      // forever. SSE stays open (server.timeout above disables its idle limit).
+      const signal = isStream ? req.signal : AbortSignal.any([req.signal, AbortSignal.timeout(90_000)])
       try {
         const res = await fetch(up.url + url.pathname + url.search, {
           method: req.method,
           headers,
           body,
-          signal: req.signal,
+          signal,
           redirect: "manual",
         })
         if (lastLogged) logState(`opencode  connected  ${up.url}`)
@@ -151,19 +172,22 @@ export async function startServer(opts: ServerOptions) {
         out.set("cache-control", "no-store")
         // Model settings and variant bodies can contain provider credentials.
         // Only expose the identity and effort IDs needed by the UI.
-        if (res.ok && req.method !== "HEAD" && (url.pathname === "/api/model" || url.pathname === "/api/model/default")) {
+        if (res.ok && req.method !== "HEAD" && (path === "/api/model" || path === "/api/model/default")) {
           const payload = await res.json() as { data: any }
-          const safeModel = (m: any) => m ? {
+          const safeModel = (m: any) => m && typeof m.id === "string" && typeof m.providerID === "string" ? {
             id: m.id,
             providerID: m.providerID,
-            name: m.name,
-            enabled: m.enabled,
-            status: m.status,
+            name: typeof m.name === "string" ? m.name : undefined,
+            enabled: typeof m.enabled === "boolean" ? m.enabled : undefined,
+            status: typeof m.status === "string" ? m.status : undefined,
             variant: typeof m.variant === "string" ? m.variant : undefined,
-            variants: Array.isArray(m.variants) ? m.variants.map((v: any) => ({ id: typeof v === "string" ? v : v.id })) : [],
+            variants: Array.isArray(m.variants) ? m.variants.flatMap((v: any) => {
+              const id = typeof v === "string" ? v : v?.id
+              return typeof id === "string" && id ? [{ id }] : []
+            }) : [],
           } : null
           return Response.json({
-            data: Array.isArray(payload.data) ? payload.data.map(safeModel) : safeModel(payload.data),
+            data: Array.isArray(payload.data) ? payload.data.map(safeModel).filter((m) => m !== null) : safeModel(payload.data),
           }, { headers: out })
         }
         if (isStream) {

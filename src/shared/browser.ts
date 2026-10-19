@@ -27,7 +27,12 @@ export function browserUrl(value: string): string {
   const normalized = /^https?:\/\//i.test(input) ? input
     : /^(?:localhost|127\.\d+\.\d+\.\d+|\[[\da-f:]+\])(?::|\/|$)/i.test(input) ? `http://${input}`
     : `https://${input}`
-  const url = new URL(normalized)
+  let url: URL
+  try {
+    url = new URL(normalized)
+  } catch {
+    throw new Error("Enter a valid HTTP(S) URL.")
+  }
   if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || !url.hostname) {
     throw new Error("Enter an HTTP(S) URL without embedded credentials.")
   }

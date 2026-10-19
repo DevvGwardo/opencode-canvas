@@ -217,6 +217,14 @@ button {
   box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.05);
 }
 
+/* Keyboard focus. The canvas uses a roving tabindex, so this ring marks the
+   card the arrow keys and Enter act on. */
+.card:focus-visible,
+.card-new:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
 .card.inert {
   pointer-events: none;
 }
@@ -341,6 +349,102 @@ button {
 
 .card-sub {
   flex: none;
+}
+
+/* ---- agents layout: who started whom --------------------------------------- */
+
+.links {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 1px;
+  height: 1px;
+  overflow: visible;
+  pointer-events: none;
+  z-index: 0;
+}
+
+.links .link {
+  fill: none;
+  stroke: rgba(106, 166, 255, 0.5);
+  stroke-width: 1.5;
+  transition: stroke 0.3s;
+}
+
+.links .link.st-working {
+  stroke: rgba(70, 211, 126, 0.6);
+}
+
+.links .link.st-needs-you {
+  stroke: var(--st-ask);
+}
+
+.links .link.st-failed {
+  stroke: rgba(229, 103, 90, 0.6);
+}
+
+.links .link.st-done,
+.links .link.st-stopped {
+  stroke: rgba(255, 255, 255, 0.16);
+}
+
+.links .link-dot {
+  fill: var(--bg);
+  stroke: rgba(106, 166, 255, 0.7);
+  stroke-width: 1.5;
+}
+
+.links:empty {
+  display: none;
+}
+
+.card-meta {
+  display: none;
+  margin-top: 4px;
+  font-size: 11.5px;
+  color: var(--text-4);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+[data-layout="agents"] .card-meta:not(:empty) {
+  display: block;
+}
+
+[data-layout="agents"] .group-label .count {
+  opacity: 1;
+}
+
+[data-layout="agents"] .card.has-sub .card-sub {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  margin: -2px -6px;
+  border-radius: var(--radius);
+  cursor: pointer;
+}
+
+[data-layout="agents"] .card.has-sub .card-sub:hover {
+  color: var(--text-2);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+[data-layout="agents"] .card.has-sub .card-sub::after {
+  content: "";
+  width: 5px;
+  height: 5px;
+  margin-top: -3px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: rotate(45deg);
+  transition: transform 0.2s;
+}
+
+[data-layout="agents"] .card.collapsed .card-sub::after {
+  margin-top: 0;
+  transform: rotate(-45deg);
 }
 
 .dot {
@@ -1565,6 +1669,27 @@ button {
   gap: 4px;
   margin-top: 12px;
   font-size: 13px;
+  border: 0;
+  padding: 0;
+  min-width: 0;
+}
+
+.ask-form .opt {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 5px 0;
+}
+
+.ask-form .option-text .field-desc {
+  display: block;
+  margin-top: 2px;
+}
+
+.ask-error {
+  color: var(--danger);
+  margin-top: 12px;
+  font-size: 13px;
 }
 
 .ask-form .field.inline {
@@ -1582,8 +1707,8 @@ button {
   font-size: 12px;
 }
 
-.ask-form input[type="text"],
-.ask-form input[type="number"],
+.ask-form input:not([type="checkbox"]):not([type="radio"]),
+.ask-form textarea,
 .ask-form select {
   background: #101010;
   border: 1px solid #2a2a2a;
@@ -1595,8 +1720,18 @@ button {
 }
 
 .ask-form input:focus,
+.ask-form textarea:focus,
 .ask-form select:focus {
   border-color: #444;
+}
+
+.ask-form textarea {
+  resize: vertical;
+  min-height: 58px;
+}
+
+.ask-form fieldset[hidden] {
+  display: none;
 }
 
 .dim {

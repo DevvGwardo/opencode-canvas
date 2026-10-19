@@ -2,8 +2,8 @@
 
 import type { Rect } from "./camera"
 
-export type LayoutName = "satellites" | "fold" | "tabs" | "tree"
-export const LAYOUTS: LayoutName[] = ["satellites", "fold", "tabs", "tree"]
+export type LayoutName = "satellites" | "fold" | "tabs" | "tree" | "agents"
+export const LAYOUTS: LayoutName[] = ["satellites", "fold", "tabs", "tree", "agents"]
 
 export const CARD_W = 300
 export const NEW_CARD_H = 104
@@ -17,6 +17,8 @@ export interface LayoutItem {
   kind: "session" | "new"
   h: number
   updated: number
+  parent?: string // subagent sessions: the session that started it (agents layout only)
+  cost?: number
 }
 
 export interface LayoutGroup {
@@ -47,9 +49,18 @@ export interface LabelPlacement {
   opacity: number
 }
 
+/** A connector from a parent agent to one child, as an SVG path. */
+export interface LinkPlacement {
+  from: string
+  to: string
+  d: string
+  dot: [number, number] // anchor on the parent's edge
+}
+
 export interface LayoutResult {
   cards: Map<string, Placement>
   labels: LabelPlacement[]
+  links: LinkPlacement[]
   groups: Map<string, Rect>
   bounds: Rect
 }
@@ -59,6 +70,7 @@ export interface LayoutOptions {
   query?: (id: string) => boolean // search filter; when set, results get a flat grid
   aspect?: number // viewport width / height; rows wrap so the whole map matches it
   resultLabel?: (count: number) => string // heading for the filtered grid
+  collapsed?: Set<string> // agents: sessions whose subagents are folded away
 }
 
 interface Block {
@@ -260,6 +272,169 @@ function satellites(groups: LayoutGroup[], o: LayoutOptions, out: LayoutResult) 
   shelf(groups.map(satellitesBlock), o.aspect ?? 1.6, 2400, out)
 }
 
+// ---- agents: who started whom --------------------------------------------------
+
+const DROP = 52 // parent bottom to the children's top edge
+const KID_GAP = 20
+const INDENT = 28
+const STACK_GAP = 12
+const CORNER = 8
+const ELBOW_Y = 24 // where a stacked child's connector meets its left edge
+
+function agentsBlock(g: LayoutGroup, collapsed?: Set<string>): Block {
+  const kids = new Map<string, LayoutItem[]>()
+  for (const it of g.items)
+    if (it.parent) {
+      if (!kids.has(it.parent)) kids.set(it.parent, [])
+      kids.get(it.parent)!.push(it)
+    }
+  const open = (id: string) => !collapsed?.has(id) && !!kids.get(id)?.length
+  const roots = g.items.filter((i) => !i.parent && i.kind === "session")
+  const trees = roots.filter((r) => kids.has(r.id))
+  // Sessions that never started a subagent pack into columns, like the Tree layout.
+  const loose = g.items.filter((i) => !i.parent && !kids.has(i.id))
+
+  const stackSize = (it: LayoutItem): { w: number; h: number } => {
+    let w = CARD_W
+    let h = it.h
+    if (open(it.id))
+      for (const k of kids.get(it.id)!) {
+        const s = stackSize(k)
+        w = Math.max(w, INDENT + s.w)
+        h += STACK_GAP + s.h
+      }
+    return { w, h }
+  }
+  const treeSize = (r: LayoutItem) => {
+    if (!open(r.id)) return { w: CARD_W, h: r.h }
+    const sizes = kids.get(r.id)!.map(stackSize)
+    const row = sizes.reduce((a, s) => a + s.w, 0) + (sizes.length - 1) * KID_GAP
+    return { w: Math.max(CARD_W, row), h: r.h + DROP + Math.max(...sizes.map((s) => s.h)) }
+  }
+
+  const units: Array<{ w: number; h: number; place(x: number, y: number, out: LayoutResult): void }> = []
+  for (const r of trees) {
+    const size = treeSize(r)
+    units.push({ ...size, place: (x, y, out) => placeTree(r, x, y, size.w, out) })
+  }
+  const per = 6
+  const cols = Math.max(1, Math.ceil(loose.length / per))
+  if (loose.length) {
+    const colH = new Array(cols).fill(0)
+    const pos = loose.map((it, i) => {
+      const c = Math.floor(i / per)
+      const p = { it, c, y: colH[c] }
+      colH[c] += it.h + GAP
+      return p
+    })
+    units.push({
+      w: cols * CARD_W + (cols - 1) * GAP,
+      h: Math.max(...colH) - GAP,
+      place: (x, y, out) => {
+        for (const p of pos) out.cards.set(p.it.id, card(x + p.c * (CARD_W + GAP), y + p.y, p.it.h))
+      },
+    })
+  }
+
+  function hide(it: LayoutItem, at: Placement, out: LayoutResult) {
+    out.cards.set(it.id, { ...at, h: it.h, scale: 0.9, opacity: 0, interactive: false, z: 0 })
+    for (const k of kids.get(it.id) ?? []) hide(k, at, out)
+  }
+
+  function placeKids(it: LayoutItem, at: Placement, out: LayoutResult, place: (k: LayoutItem) => void) {
+    if (open(it.id)) for (const k of kids.get(it.id)!) place(k)
+    else for (const k of kids.get(it.id) ?? []) hide(k, at, out)
+  }
+
+  /** A child with its own descendants stacked underneath, indented. */
+  function placeStack(it: LayoutItem, x: number, y: number, out: LayoutResult): number {
+    const me = card(x, y, it.h)
+    out.cards.set(it.id, me)
+    let cy = y + it.h
+    const lx = x + INDENT / 2
+    placeKids(it, me, out, (k) => {
+      cy += STACK_GAP
+      const ky = cy + Math.min(ELBOW_Y, k.h / 2)
+      out.links.push({
+        from: it.id,
+        to: k.id,
+        dot: [lx, y + it.h],
+        d: `M${lx} ${y + it.h}V${ky - CORNER}Q${lx} ${ky} ${lx + CORNER} ${ky}H${x + INDENT}`,
+      })
+      cy = placeStack(k, x + INDENT, cy, out)
+    })
+    return cy
+  }
+
+  function placeTree(r: LayoutItem, x: number, y: number, w: number, out: LayoutResult) {
+    const rx = x + (w - CARD_W) / 2
+    const root = card(rx, y, r.h)
+    out.cards.set(r.id, root)
+    const px = rx + CARD_W / 2
+    const py = y + r.h
+    const bus = py + DROP / 2
+    const ky = py + DROP
+    const sizes = open(r.id) ? kids.get(r.id)!.map(stackSize) : []
+    let kx = x + (w - (sizes.reduce((a, s) => a + s.w, 0) + Math.max(0, sizes.length - 1) * KID_GAP)) / 2
+    let i = 0
+    placeKids(r, root, out, (k) => {
+      const cx = kx + CARD_W / 2
+      const dx = Math.sign(cx - px)
+      const c = Math.min(CORNER, Math.abs(cx - px))
+      out.links.push({
+        from: r.id,
+        to: k.id,
+        dot: [px, py],
+        d: dx
+          ? `M${px} ${py}V${bus - c}Q${px} ${bus} ${px + dx * c} ${bus}H${cx - dx * c}Q${cx} ${bus} ${cx} ${bus + c}V${ky}`
+          : `M${px} ${py}V${ky}`,
+      })
+      placeStack(k, kx, ky, out)
+      kx += sizes[i++].w + KID_GAP
+    })
+  }
+
+  // Wrap units into rows so a busy project doesn't become one endless strip.
+  const rowWidth = Math.max(2400, ...units.map((u) => u.w))
+  const spots: Array<{ x: number; y: number }> = []
+  let ux = 0
+  let uy = LABEL_H
+  let rowH = 0
+  let w = 0
+  for (const u of units) {
+    if (ux > 0 && ux + u.w > rowWidth) {
+      ux = 0
+      uy += rowH + GROUP_GAP_Y
+      rowH = 0
+    }
+    spots.push({ x: ux, y: uy })
+    w = Math.max(w, ux + u.w)
+    ux += u.w + GROUP_GAP_X
+    rowH = Math.max(rowH, u.h)
+  }
+  const h = uy + rowH
+  const agents = g.items.filter((i) => i.kind === "session")
+  const cost = agents.reduce((a, i) => a + (i.cost ?? 0), 0)
+  const sub = `${agents.length} agent${agents.length === 1 ? "" : "s"}${cost > 0 ? ` · ${formatCost(cost)}` : ""}`
+  return {
+    key: g.key,
+    w,
+    h,
+    place(ox, oy, out) {
+      label(out, g.key, g.label, ox, oy, Math.max(w, CARD_W), sub)
+      units.forEach((u, i) => u.place(ox + spots[i].x, oy + spots[i].y, out))
+    },
+  }
+}
+
+export function formatCost(usd: number) {
+  return usd >= 100 ? `$${Math.round(usd)}` : `$${usd.toFixed(2)}`
+}
+
+function agents(groups: LayoutGroup[], o: LayoutOptions, out: LayoutResult) {
+  shelf(groups.map((g) => agentsBlock(g, o.collapsed)), o.aspect ?? 1.6, 2400, out)
+}
+
 function searchGrid(groups: LayoutGroup[], previous: LayoutResult | undefined, o: LayoutOptions, out: LayoutResult) {
   const all = groups.flatMap((g) => g.items.filter((i) => i.kind === "session"))
   const hits = all.filter((i) => o.query!(i.id)).sort((a, b) => b.updated - a.updated)
@@ -298,12 +473,29 @@ export function layout(
   opts: LayoutOptions = {},
   previous?: LayoutResult,
 ): LayoutResult {
-  const out: LayoutResult = { cards: new Map(), labels: [], groups: new Map(), bounds: { x: 0, y: 0, w: 0, h: 0 } }
-  if (opts.query) searchGrid(groups, previous, opts, out)
-  else if (name === "tree") tree(groups, opts, out)
-  else if (name === "tabs") tabs(groups, opts, out)
-  else if (name === "fold") fold(groups, opts, out)
-  else satellites(groups, opts, out)
+  const out: LayoutResult = { cards: new Map(), labels: [], links: [], groups: new Map(), bounds: { x: 0, y: 0, w: 0, h: 0 } }
+  // Only the agents layout shows subagents; everywhere else they tuck in behind their root.
+  const tops = name === "agents" && !opts.query ? groups : groups.map((g) => ({ ...g, items: g.items.filter((i) => !i.parent) }))
+  if (opts.query) searchGrid(tops, previous, opts, out)
+  else if (name === "tree") tree(tops, opts, out)
+  else if (name === "tabs") tabs(tops, opts, out)
+  else if (name === "fold") fold(tops, opts, out)
+  else if (name === "agents") agents(tops, opts, out)
+  else satellites(tops, opts, out)
+  for (const g of groups) {
+    const byId = new Map(g.items.map((i) => [i.id, i]))
+    for (const it of g.items) {
+      if (out.cards.has(it.id)) continue
+      let top = it
+      const seen = new Set<string>()
+      while (top.parent && byId.has(top.parent) && !seen.has(top.id)) {
+        seen.add(top.id)
+        top = byId.get(top.parent)!
+      }
+      const at = out.cards.get(top.id) ?? previous?.cards.get(it.id) ?? card(0, 0, it.h)
+      out.cards.set(it.id, { ...at, h: it.h, scale: at.scale * 0.9, opacity: 0, interactive: false, z: 0 })
+    }
+  }
 
   let x0 = Infinity
   let y0 = Infinity

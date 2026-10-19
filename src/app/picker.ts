@@ -6,6 +6,7 @@ import { basename, timeAgo } from "./format"
 import { defaultModel, effortLabel, modelRef, models, serverDefault, setDefaultModel } from "./models"
 import type { Store } from "./store"
 import type { ModelRef } from "./types"
+import { toast } from "./toast"
 
 interface Option {
   kind: "project" | "folder" | "path" | "model" | "server-default"
@@ -49,6 +50,8 @@ export class NewSessionPicker {
   private mode: "where" | "model" = "where"
   private whereQuery = ""
   private preferred?: string
+  private modelDirectory?: string
+  private choosing?: HTMLElement
   /** undefined = OpenCode's configured default. */
   private model?: ModelRef
 
@@ -67,9 +70,12 @@ export class NewSessionPicker {
   open(preferDirectory?: string) {
     if (this.el) return this.input.focus()
     this.preferred = preferDirectory
+    this.modelDirectory = preferDirectory
     this.model = defaultModel()
     this.mode = "where"
     this.whereQuery = ""
+    this.options = []
+    this.active = 0
     this.folderCache.clear()
 
     const scrim = h("div", "picker-scrim")
@@ -139,6 +145,7 @@ export class NewSessionPicker {
   private async renderModelButton() {
     const btn = this.modelBtn
     const selected = this.model
+    const directory = this.modelDirectory
     const effort = this.effort
     effort.disabled = true
     btn.replaceChildren(h("span", "pm-k", "Model"))
@@ -146,18 +153,18 @@ export class NewSessionPicker {
     let sub: string
     let option: ModelOption | undefined
     if (selected) {
-      const all = await models(this.backend).catch(() => [] as ModelOption[])
+      const all = await models(this.backend, directory).catch(() => [] as ModelOption[])
       const m = all.find((x) => keyOf(x) === keyOf(selected))
       option = m
       name = m?.name ?? selected.id
       sub = selected.providerID
     } else {
-      const d = await serverDefault(this.backend)
+      const d = await serverDefault(this.backend, directory)
       option = d
       name = d ? d.name : "OpenCode default"
       sub = d ? "OpenCode default" : ""
     }
-    if (btn !== this.modelBtn || selected !== this.model || !this.el) return
+    if (btn !== this.modelBtn || selected !== this.model || directory !== this.modelDirectory || !this.el) return
     if (this.model?.variant && option && !option.variants?.includes(this.model.variant)) {
       this.model = { id: this.model.id, providerID: this.model.providerID }
       setDefaultModel(this.model)
@@ -255,7 +262,10 @@ export class NewSessionPicker {
   // ---- model -------------------------------------------------------------------
 
   private async modelOptions(q: string, seq: number): Promise<Option[] | undefined> {
-    const [all, def] = await Promise.all([models(this.backend).catch(() => [] as ModelOption[]), serverDefault(this.backend)])
+    const [all, def] = await Promise.all([
+      models(this.backend, this.modelDirectory).catch(() => [] as ModelOption[]),
+      serverDefault(this.backend, this.modelDirectory),
+    ])
     if (seq !== this.seq) return undefined
     const terms = q.toLowerCase().split(/\s+/).filter(Boolean)
     const match = (s: string) => terms.every((t) => s.toLowerCase().includes(t))
@@ -305,6 +315,13 @@ export class NewSessionPicker {
   }
 
   private render(empty: string) {
+    if (this.mode === "where") {
+      const directory = this.options[this.active]?.directory ?? this.preferred
+      if (directory !== this.modelDirectory) {
+        this.modelDirectory = directory
+        void this.renderModelButton()
+      }
+    }
     this.list.replaceChildren()
     if (!this.options.length) {
       this.list.append(h("div", "picker-empty", empty))
@@ -339,25 +356,47 @@ export class NewSessionPicker {
 
   private async choose() {
     const o = this.options[this.active]
-    if (!o) return
+    const picker = this.el
+    if (!o || !picker || this.choosing === picker) return
     if (this.mode === "model") {
       this.model = o.kind === "server-default" ? undefined : o.model
       setDefaultModel(this.model) // remembered for the next new session
       await this.renderModelButton()
+      if (this.el !== picker) return
       return this.setMode("where")
     }
     if (!o.directory) return
-    // Make sure a typed folder exists before creating a session there.
-    if (o.kind !== "project" && o.directory !== "/") {
-      const parent = o.directory.slice(0, o.directory.lastIndexOf("/")) || "/"
-      const siblings = await this.folders(parent)
-      if (!siblings?.includes(basename(o.directory))) {
-        this.list.replaceChildren(h("div", "picker-empty error", `${o.directory} doesn't exist (or isn't a folder).`))
-        return
+    this.choosing = picker
+    const selected = this.model
+    const autoApprove = this.autoBox.checked
+    try {
+      // Make sure a typed folder exists before creating a session there.
+      if (o.kind !== "project" && o.directory !== "/") {
+        const parent = o.directory.slice(0, o.directory.lastIndexOf("/")) || "/"
+        const siblings = await this.folders(parent)
+        if (this.el !== picker) return
+        if (!siblings?.includes(basename(o.directory))) {
+          this.list.replaceChildren(h("div", "picker-empty error", `${o.directory} doesn't exist (or isn't a folder).`))
+          return
+        }
       }
+      let model = selected
+      if (selected) {
+        const all = await models(this.backend, o.directory)
+        if (this.el !== picker) return
+        const option = all.find((m) => keyOf(m) === keyOf(selected))
+        if (!option) throw new Error("This model is unavailable in the selected project. Choose another model or OpenCode default.")
+        model = modelRef(option, selected)
+      }
+      if (this.el !== picker) return
+      this.close()
+      await this.onPick(o.directory, model, autoApprove)
+    } catch (e) {
+      if (this.el === picker) this.list.replaceChildren(h("div", "picker-empty error", (e as Error).message))
+      else if (!this.el) toast(`Couldn't create a session: ${(e as Error).message}`)
+    } finally {
+      if (this.choosing === picker) this.choosing = undefined
     }
-    this.close()
-    await this.onPick(o.directory, this.model, this.autoBox.checked)
   }
 
   private onKey(e: KeyboardEvent) {

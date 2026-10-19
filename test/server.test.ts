@@ -1,5 +1,6 @@
 import { afterAll, describe, expect, test } from "bun:test"
 import { createServer } from "node:net"
+import { gzipSync } from "node:zlib"
 import { startServer } from "../src/server/server"
 
 // A stand-in OpenCode server that records what the proxy sends it.
@@ -12,16 +13,17 @@ const fake = Bun.serve({
     const url = new URL(req.url)
     seen.push({ path: url.pathname + url.search, auth: req.headers.get("authorization"), origin: req.headers.get("origin") })
     if (url.pathname === "/api/info") return Response.json({ version: "2.0.test" })
-    if (url.pathname === "/api/model" || url.pathname === "/api/model/default") {
+    const path = decodeURIComponent(url.pathname).replace(/\/+$/, "")
+    if (path === "/api/model" || path === "/api/model/default") {
       const model = {
         id: "m", providerID: "p", name: "Model", enabled: true,
         headers: { authorization: "provider-secret" },
         settings: { apiKey: "provider-secret" },
-        variants: [{ id: "high", headers: { authorization: "provider-secret" }, settings: { effort: "high" } }],
+        variants: [null, {}, 123, { id: "high", headers: { authorization: "provider-secret" }, settings: { effort: "high" } }],
       }
-      return Response.json({ data: url.pathname.endsWith("/default") ? model : [model] })
+      return Response.json({ data: path.endsWith("/default") ? model : [model] })
     }
-    if (url.pathname === "/api/event") {
+    if (path === "/api/event") {
       const body = new ReadableStream({
         start(c) {
           c.enqueue(new TextEncoder().encode(`data: {"type":"server.connected","data":{}}\n\n`))
@@ -80,6 +82,8 @@ describe("proxy", () => {
       expect(text).not.toContain("provider-secret")
       expect(text).not.toContain("settings")
       expect(text).toContain('"id":"high"')
+      const data = JSON.parse(text).data
+      expect((Array.isArray(data) ? data[0] : data).variants).toEqual([{ id: "high" }])
       expect(res.headers.get("cache-control")).toBe("no-store")
     }
     const head = await fetch(base + "/api/model/default", { method: "HEAD" })
@@ -94,6 +98,18 @@ describe("proxy", () => {
     expect(a.status).toBe(403)
     expect(b.status).toBe(403)
     expect(seen.length).toBe(before)
+  })
+
+  test("model route aliases cannot bypass credential filtering", async () => {
+    for (const path of ["/api/model/", "/api/%6dodel", "/api/model/default/", "/api/%6dodel/%64efault"]) {
+      const res = await fetch(base + path)
+      expect(res.status).toBe(200)
+      const text = await res.text()
+      expect(text).not.toContain("provider-secret")
+      const data = JSON.parse(text).data
+      const model = Array.isArray(data) ? data[0] : data
+      expect(Object.keys(model).sort()).toEqual(["enabled", "id", "name", "providerID", "variants"].sort())
+    }
   })
 
   test("rejects non-loopback Host headers (DNS rebinding)", async () => {
@@ -137,7 +153,7 @@ describe("authenticated server", () => {
       const res = await fetch(url + "/api/session", { headers: { cookie, origin: url } })
       expect(res.status).toBe(200)
       expect(seen.at(-1)?.auth).toBe("Basic " + btoa("opencode:secret"))
-      const events = await fetch(url + "/api/event?hold=1", { headers: { cookie } })
+      const events = await fetch(url + "/api/%65vent/?hold=1", { headers: { cookie } })
       const reader = events.body!.getReader()
       expect((await reader.read()).done).toBe(false)
       await fetch(url + "/canvas/auth", { method: "DELETE", headers: { cookie } })
@@ -147,6 +163,35 @@ describe("authenticated server", () => {
       protectedServer.stop(true)
     }
   })
+})
+
+test("decompresses a gzipped upstream response without leaking its encoding headers", async () => {
+  const payload = { data: [{ id: "s1", name: "x".repeat(500) }] }
+  const gz = gzipSync(Buffer.from(JSON.stringify(payload)))
+  const gzipper = Bun.serve({
+    port: 0, hostname: "127.0.0.1",
+    fetch(req) {
+      if (new URL(req.url).pathname === "/api/info") return Response.json({ version: "2.0.test" })
+      return new Response(gz, {
+        headers: { "content-type": "application/json", "content-encoding": "gzip", "content-length": String(gz.length) },
+      })
+    },
+  })
+  const { server: canvas } = await startServer({
+    port: 0, hostname: "127.0.0.1", demo: false, dev: false,
+    server: `http://127.0.0.1:${gzipper.port}`, password: "secret", autostart: false, quiet: true,
+  })
+  try {
+    const res = await fetch(`http://127.0.0.1:${canvas.port}/api/session`, { headers: { "accept-encoding": "gzip" } })
+    expect(res.status).toBe(200)
+    // The proxy strips the (now-decompressed) encoding/length headers so the
+    // browser never sees a stale content-length or double-decodes the body.
+    expect(res.headers.get("content-encoding")).toBeNull()
+    expect(await res.json()).toEqual(payload)
+  } finally {
+    canvas.stop(true)
+    gzipper.stop(true)
+  }
 })
 
 test("a transport failure never automatically resends a write", async () => {

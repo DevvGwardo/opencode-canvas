@@ -13,7 +13,7 @@ export function defaultModel(): ModelRef | undefined {
     // Read the old provider/model string as well as the variant-aware format.
     if (!v.startsWith("{")) {
       const i = v.indexOf("/")
-      return i > 0 ? { providerID: v.slice(0, i), id: v.slice(i + 1) } : undefined
+      return i > 0 && i < v.length - 1 ? { providerID: v.slice(0, i), id: v.slice(i + 1) } : undefined
     }
     const m = JSON.parse(v)
     if (typeof m?.providerID !== "string" || !m.providerID || typeof m.id !== "string" || !m.id) return undefined

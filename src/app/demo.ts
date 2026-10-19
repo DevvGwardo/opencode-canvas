@@ -32,6 +32,18 @@ const PROJECTS: Array<[string, string]> = [
   ["p_infra", "infra"],
 ]
 
+/** A subagent in a seeded team, with the subagents it started. */
+interface Member {
+  title: string
+  agent: string
+  model: string
+  cost: number
+  text: string
+  running?: boolean
+  outcome?: Session["outcome"]
+  team?: Member[]
+}
+
 interface Seed {
   project: string
   title: string
@@ -42,9 +54,47 @@ interface Seed {
   outcome?: Session["outcome"]
   user?: string
   unseen?: boolean
+  team?: Member[]
+  model?: string
+  cost?: number
 }
 
 const SEEDS: Seed[] = [
+  {
+    project: "p_web",
+    title: "Launch the annual billing page",
+    ago: 1 * MIN,
+    running: true,
+    model: "claude-opus-5-5",
+    cost: 1.42,
+    text: "Splitting this into research, copy and the build. I'll merge their work once the checkout tests pass.",
+    team: [
+      {
+        title: "Compare annual discounts across competitors",
+        agent: "research",
+        model: "claude-sonnet-5-5",
+        cost: 0.21,
+        text: "Most offer two months free on annual plans; two show the saving as a percentage.",
+        team: [
+          { title: "Read six public pricing pages", agent: "scrape", model: "deepseek-v4.1-flash", cost: 0.03, text: "Collected plan names, prices and annual terms into a table." },
+          { title: "Group billing questions from support tickets", agent: "analyst", model: "claude-sonnet-5-5", cost: 0.06, running: true, text: "Sorting 140 tickets into themes." },
+        ],
+      },
+      { title: "Draft copy for the three plans", agent: "writer", model: "claude-sonnet-5-5", cost: 0.11, running: true, text: "Working on the headline and the plan comparison table." },
+      {
+        title: "Build the page and wire up checkout",
+        agent: "build",
+        model: "deepseek-v4.1-flash",
+        cost: 0.34,
+        running: true,
+        text: "The page renders behind a flag. Checkout needs the annual price IDs.",
+        team: [
+          { title: "Write the checkout tests", agent: "test", model: "demo-model", cost: 0.04, outcome: "interrupted", text: "Stopped: the coupon fixture was out of date." },
+          { title: "Fix the coupon fixture and rerun", agent: "test", model: "demo-model", cost: 0.02, running: true, text: "Rerunning the suite with the new fixture." },
+        ],
+      },
+    ],
+  },
   { project: "p_web", title: "Checkout redesign", ago: 2 * MIN, running: true, subagents: 4, user: "Can we keep the old flow behind a flag for a week?", text: "The new checkout is **two steps instead of four**. Address and payment now share one screen, and the order summary stays pinned on desktop.\n\nLighthouse is at **96** on mobile. I'm wiring the analytics events next." },
   { project: "p_web", title: "Fix flaky cart tests", ago: 9 * MIN, running: true, subagents: 2, text: "The flake comes from a shared fake clock between test files.\n\n- Give each suite its own clock\n- Drop the retry wrapper that hid it" },
   { project: "p_web", title: "Image CDN migration", ago: 12 * MIN, subagents: 1, text: "Product images now come from the CDN with AVIF first. Read 6 files, patched 3, ran 4 commands." },
@@ -107,8 +157,8 @@ export class DemoBackend implements Backend {
         id,
         projectID: proj.id,
         agent: "build",
-        model: { id: "demo-model", providerID: "demo" },
-        cost: 0,
+        model: { id: seed.model ?? "demo-model", providerID: "demo" },
+        cost: seed.cost ?? 0,
         tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
         outcome: seed.running ? undefined : (seed.outcome ?? "succeeded"),
         time: {
@@ -153,6 +203,7 @@ export class DemoBackend implements Backend {
         })
         this.msgs.set(cid, [])
       }
+      this.addTeam(s, seed.team ?? [], t0)
       if (seed.running) {
         this.running.add(id)
         if (seed.user) {
@@ -168,6 +219,41 @@ export class DemoBackend implements Backend {
       this.perms.set(blocked.id, [
         { id: uid("per"), sessionID: blocked.id, action: "shell", resources: ["git push origin feature/refund-webhooks"] },
       ])
+  }
+
+  private addTeam(parent: Session, team: Member[], t0: number) {
+    team.forEach((m, k) => {
+      const id = uid("ses")
+      const created = t0 + 4000 + k * 3000
+      const s: Session = {
+        ...parent,
+        id,
+        parentID: parent.id,
+        agent: m.agent,
+        model: { id: m.model, providerID: "demo" },
+        cost: m.cost,
+        outcome: m.running ? undefined : (m.outcome ?? "succeeded"),
+        title: m.title,
+        time: m.running ? { created, updated: Date.now() } : { created, updated: created + 25_000, idle: created + 25_000, viewed: created + 25_000 },
+      }
+      this.sessions.set(id, s)
+      this.msgs.set(id, [
+        { type: "user", id: uid("msg"), time: { created }, text: m.title },
+        {
+          type: "assistant",
+          id: uid("msg"),
+          time: { created: created + 1000, completed: s.time.updated },
+          agent: m.agent,
+          model: s.model!,
+          content: [{ type: "text", text: m.text }],
+        },
+      ])
+      this.addTeam(s, m.team ?? [], created)
+      if (m.running) {
+        this.running.add(id)
+        setTimeout(() => this.loop(id, true), 600 + Math.random() * 2500)
+      }
+    })
   }
 
   // ---- event plumbing ----
@@ -264,7 +350,13 @@ export class DemoBackend implements Backend {
       if (!forever || rounds > 50) break
       await this.sleep(2500 + Math.random() * 3000)
     }
-    if (this.running.delete(id) || !forever) {
+    // The loop leaves `running` only when it finished its rounds; an interrupt
+    // removes the id first, so a still-present id means it completed on its own.
+    // (The old `|| !forever` also fired after an interrupt, overwriting
+    // "interrupted" with "succeeded".)
+    const completed = this.running.has(id)
+    this.running.delete(id)
+    if (completed) {
       s.outcome = "succeeded"
       s.time.updated = Date.now()
       s.time.idle = Date.now()
@@ -308,6 +400,9 @@ export class DemoBackend implements Backend {
     return structuredClone(this.perms.get(id) ?? [])
   }
   async forms(_id: string): Promise<FormInfo[]> {
+    return []
+  }
+  async pendingForms(_directory: string): Promise<FormInfo[]> {
     return []
   }
   async listModels() {
