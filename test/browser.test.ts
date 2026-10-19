@@ -102,4 +102,4 @@ test.skipIf(!executable)("real Chromium streams an isolated viewport, accepts in
     fixture.stop(true)
   }
   expect(host.running).toBe(false)
-}, 40_000)
+}, 70_000)

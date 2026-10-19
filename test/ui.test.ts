@@ -42,4 +42,4 @@ test.skipIf(!executable)("question and transcript regressions in real Chromium",
     await browser.stop()
     fixture.stop(true)
   }
-}, 30_000)
+}, 60_000)

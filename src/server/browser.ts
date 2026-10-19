@@ -150,7 +150,8 @@ export class BrowserHost {
       "about:blank",
     ], { stdout: "ignore", stderr: "ignore", stdin: "ignore" })
     let port: number | undefined
-    for (let i = 0; i < 100; i++) {
+    // A cold start on a slow host (CI runners, first launch) can take well over 10s.
+    for (let i = 0; i < 300; i++) {
       if (generation !== this.generation) throw new Error("Browser startup cancelled")
       if (this.proc.exitCode !== null) throw new Error("Chromium exited before starting. Check CANVAS_BROWSER_BIN and host browser support.")
       try {
