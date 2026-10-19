@@ -18,4 +18,10 @@ jobs:
       # Ubuntu 24.04 blocks the unprivileged user namespaces Chrome's sandbox
       # needs, so the real-Chromium tests hang at startup without this.
       - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - run: |
+          which google-chrome chromium chromium-browser || true
+          bun -e 'import {findBrowser} from "./src/server/browser"; console.log("found:", findBrowser())'
+          B=$(bun -e 'import {findBrowser} from "./src/server/browser"; console.log(findBrowser())')
+          timeout 20 "$B" --headless=new --remote-debugging-port=0 --user-data-dir=/tmp/p1 --no-first-run about:blank 2>&1 | head -40 || true
+          ls /tmp/p1 || true
       - run: bun test
