@@ -81,3 +81,14 @@ export function validateBrowserAction(value: unknown): BrowserAction {
   }
   throw new Error("Invalid browser action")
 }
+
+/** Readable message for a failed browser-action response. A reverse proxy
+ *  answers with an HTML error page, so only a JSON body carries a message
+ *  worth showing; anything else falls back to the status code. */
+export function actionErrorMessage(status: number, text: string): string {
+  try {
+    const body = JSON.parse(text) as { message?: unknown }
+    if (typeof body?.message === "string" && body.message) return body.message
+  } catch { /* not JSON — fall through to the status fallback */ }
+  return `Browser input failed (${status})`
+}

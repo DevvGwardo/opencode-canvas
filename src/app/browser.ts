@@ -1,4 +1,4 @@
-import { BROWSER_HEIGHT, BROWSER_WIDTH, browserUrl, type BrowserAction, type BrowserEvent } from "../shared/browser"
+import { actionErrorMessage, BROWSER_HEIGHT, BROWSER_WIDTH, browserUrl, type BrowserAction, type BrowserEvent } from "../shared/browser"
 
 const h = <K extends keyof HTMLElementTagNameMap>(tag: K, cls = "", text?: string) => {
   const element = document.createElement(tag)
@@ -231,7 +231,7 @@ export class BrowserPanel {
       const res = await fetch("/canvas/browser/action", {
         method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(action),
       })
-      if (!res.ok) throw new Error((await res.json()).message ?? `Browser input failed (${res.status})`)
+      if (!res.ok) throw new Error(actionErrorMessage(res.status, await res.text()))
     }).catch((e) => { this.status.textContent = (e as Error).message })
   }
 

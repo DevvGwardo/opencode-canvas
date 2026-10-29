@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { BrowserHost, findBrowser } from "../src/server/browser"
-import { browserUrl, validateBrowserAction, type BrowserEvent } from "../src/shared/browser"
+import { actionErrorMessage, browserUrl, validateBrowserAction, type BrowserEvent } from "../src/shared/browser"
 
 describe("browser input", () => {
   test("normalizes web and local development URLs", () => {
@@ -30,6 +30,15 @@ describe("browser input", () => {
     const host = new BrowserHost(undefined)
     await expect(host.start()).rejects.toThrow("Install Chrome or Chromium")
     await host.stop()
+  })
+
+  test("action failures prefer the JSON message and survive HTML error pages", () => {
+    expect(actionErrorMessage(500, JSON.stringify({ message: "Tab crashed" }))).toBe("Tab crashed")
+    // A reverse proxy answers with an HTML error page: no JSON parse error may leak out.
+    expect(actionErrorMessage(502, "<html><body>Bad gateway</body></html>")).toBe("Browser input failed (502)")
+    expect(actionErrorMessage(500, "")).toBe("Browser input failed (500)")
+    expect(actionErrorMessage(500, JSON.stringify({}))).toBe("Browser input failed (500)")
+    expect(actionErrorMessage(500, JSON.stringify({ message: "" }))).toBe("Browser input failed (500)")
   })
 })
 

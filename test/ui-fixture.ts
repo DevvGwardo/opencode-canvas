@@ -3,6 +3,7 @@ import type { Backend } from "../src/app/backend"
 import { CanvasView } from "../src/app/canvas"
 import { createSessionCard, updateSessionCard } from "../src/app/card"
 import { autoApproveToggle, autoApprovedNotices } from "../src/app/approve"
+import { BrowserPanel } from "../src/app/browser"
 import { questionForm } from "../src/app/forms"
 import { ensureAccess } from "../src/app/login"
 import { SessionPanel } from "../src/app/panel"
@@ -449,6 +450,46 @@ async function run() {
       assert(message === "Sign in failed (502)", `A non-JSON failure showed: ${message}`)
     } finally {
       window.fetch = real
+      root.remove()
+    }
+  })
+
+  await check("a browser action failure with a non-JSON body shows a plain message", async () => {
+    const realFetch = window.fetch
+    const realES = window.EventSource
+    const root = document.createElement("div")
+    host.append(root)
+    try {
+      window.fetch = (async (input: RequestInfo | URL) => {
+        if (typeof input === "string" && input.endsWith("/canvas/browser/action")) {
+          return new Response("<html><body>Bad gateway</body></html>", { status: 502, headers: { "content-type": "text/html" } })
+        }
+        return Response.json({ available: true, running: true })
+      }) as typeof fetch
+      class FakeSource {
+        onmessage: ((m: { data: string }) => void) | null = null
+        onerror: (() => void) | null = null
+        constructor(_url: string) {
+          setTimeout(() => this.onmessage?.({
+            data: JSON.stringify({ type: "state", url: "about:blank", title: "", tabs: [], active: "", width: 1280, height: 800 }),
+          }), 10)
+        }
+        close() {}
+      }
+      window.EventSource = FakeSource as unknown as typeof EventSource
+      const panel = new BrowserPanel(root, () => {})
+      panel.open()
+      await sleep(60)
+      const back = root.querySelector<HTMLButtonElement>('button[aria-label="Browser back"]')
+      assert(back, "The browser toolbar was not rendered")
+      back!.click()
+      await sleep(60)
+      const status = root.querySelector(".browser-status")?.textContent ?? ""
+      assert(status === "Browser input failed (502)", `A non-JSON action failure showed: ${status}`)
+      panel.close()
+    } finally {
+      window.fetch = realFetch
+      window.EventSource = realES
       root.remove()
     }
   })
