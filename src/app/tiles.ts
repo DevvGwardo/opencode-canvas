@@ -6,12 +6,13 @@
 import type { Backend } from "./backend"
 import { CANVAS_COMMANDS, parseCommand, runCanvasCommand, sendPrompt, SlashCommands } from "./commands"
 import { timeAgo } from "./format"
+import { parseLoopArgs, type LoopManager } from "./loops"
 import { effortLabel, modelLabel, setSessionEffort } from "./models"
 import { spinner } from "./spinners"
 import { REVIEW_WINDOW, type Status, type Store } from "./store"
 import { toast } from "./toast"
 import { Transcript } from "./transcript"
-import { autoApproveToggle } from "./approve"
+import { autoApproveToggle, autoDismissToggle } from "./approve"
 import type { InboxItem, Session } from "./types"
 
 const h = <K extends keyof HTMLElementTagNameMap>(tag: K, cls = "", text?: string) => {
@@ -88,6 +89,7 @@ class Tile {
   private stopBtn: HTMLButtonElement
   private pinBtn: HTMLButtonElement
   private maxBtn: HTMLButtonElement
+  private loopBtn: HTMLButtonElement
   private input: HTMLTextAreaElement
   private hint: HTMLElement
   private slash: SlashCommands
@@ -110,11 +112,12 @@ class Tile {
     this.statusEl = h("span", "tile-status")
     const actions = h("div", "tile-actions")
     this.stopBtn = this.button("Stop", "Interrupt", () => void this.transcript.act(() => this.backend.interrupt(id)), "stop")
+    this.loopBtn = this.button("⟳", "Loop this session (/loop)", () => this.toggleLoop(), "loop")
     this.pinBtn = this.button(ICONS.pin, "Pin this tile", () => this.view.togglePin(id), "pin")
     this.maxBtn = this.button(ICONS.max, "Maximize (double-click the header)", () => this.view.toggleMax(id))
     const open = this.button(ICONS.open, "Open on the canvas", () => this.view.openOnCanvas(id))
     const close = this.button(ICONS.close, "Dismiss", () => this.view.dismiss(id))
-    actions.append(this.pinBtn, this.maxBtn, open, close)
+    actions.append(this.loopBtn, this.pinBtn, this.maxBtn, open, close)
     row.append(this.projectEl, this.statusEl, this.stopBtn, actions)
     this.titleEl = h("div", "tile-title")
     this.modelBtn = this.button("", "Choose model and effort", () => this.view.openOnCanvas(id, "model"), "tile-model")
@@ -202,6 +205,13 @@ class Tile {
                 ? `Stopped · ${ago}`
                 : `Done · ${ago}`
     const working = status === "working" || status === "needs-you"
+    const loop = this.view.loops?.get(this.id)
+    const looping = loop?.status === "active"
+    this.root.classList.toggle("looping", !!looping)
+    this.loopBtn.classList.toggle("on", !!looping)
+    this.loopBtn.title = looping
+      ? `Looping ${loop!.iterations}/${loop!.maxIterations} — click to stop`
+      : "Loop this session: re-prompt when idle (/loop)"
     this.root.classList.toggle("auto", this.store.sessionAutoApproves(this.id))
     this.stopBtn.hidden = !working
     const pinned = this.view.isPinned(this.id)
@@ -216,6 +226,33 @@ class Tile {
     this.input.placeholder = working ? "Steer…" : "Reply…"
     this.hint.textContent = working ? "Tab to queue" : ""
     this.sendBtn.textContent = working ? "Steer" : "Send"
+  }
+
+  private toggleLoop() {
+    const loops = this.view.loops
+    if (!loops) {
+      toast("Loops aren't available here")
+      return
+    }
+    const existing = loops.get(this.id)
+    if (existing?.status === "active") {
+      loops.stop(this.id)
+      toast("Loop stopped")
+      return
+    }
+    // Use whatever is typed as the loop prompt, else the default continue prompt.
+    const typed = this.input.value.trim()
+    try {
+      loops.restart(this.id, parseLoopArgs(typed))
+      if (typed) {
+        this.input.value = ""
+        this.view.drafts.delete(this.id)
+        this.input.style.height = "auto"
+      }
+      toast("Loop started — edit it from the session panel for counts and delays")
+    } catch (e) {
+      toast(`Couldn't start loop: ${(e as Error).message}`)
+    }
   }
 
   private bindComposer() {
@@ -263,6 +300,19 @@ class Tile {
           },
           compact: async () => { await this.backend.compact(this.id, delivery); this.transcript.scheduleRefetch(80) },
           stop: () => this.backend.interrupt(this.id),
+          loop: (args) => {
+            if (!this.view.loops) return toast("Loops aren't available here")
+            try {
+              this.view.loops.restart(this.id, parseLoopArgs(args ?? ""))
+              toast("Loop started")
+            } catch (e) {
+              toast(`Couldn't start loop: ${(e as Error).message}`)
+            }
+          },
+          stoploop: () => {
+            this.view.loops?.stop(this.id)
+            toast("Loop stopped")
+          },
           browser: (url) => this.view.openBrowser(url),
         })
         if (command.name !== "help" && this.input.value === draft) this.input.value = ""
@@ -305,6 +355,8 @@ class Tile {
 export class TilesView {
   readonly el: HTMLElement
   readonly drafts = new Map<string, string>()
+  /** Set by the app: per-session auto-continue loops. */
+  loops?: LoopManager
   private grid: HTMLElement
   private countsEl: HTMLElement
   private empty: HTMLElement
@@ -351,7 +403,7 @@ export class TilesView {
     back.addEventListener("click", () => this.close())
     const browser = h("button", "tiles-btn", "Browser") as HTMLButtonElement
     browser.addEventListener("click", () => this.handlers.openBrowser())
-    tools.append(subs, autoApproveToggle(store), browser, newBtn, back)
+    tools.append(subs, autoApproveToggle(store), autoDismissToggle(store), browser, newBtn, back)
     bar.append(title, tools)
 
     this.grid = h("div", "tiles-grid")
@@ -452,8 +504,11 @@ export class TilesView {
       return true
     }
     this.hidden.delete(id)
-    // Finished while you were watching: keep it until you've looked.
+    // Finished while you were watching: keep it until you've looked. A session
+    // still "to review" (or freshly failed) stays on the board either way, so
+    // work that finishes while you're on the canvas is waiting here too.
     const fresh = this.store.unseen(id) && Date.now() - (s.time.idle ?? 0) < REVIEW_WINDOW
+    if (fresh && (st === "review" || st === "failed")) return true
     return this.seenHere.has(id) && fresh
   }
 
@@ -477,6 +532,13 @@ export class TilesView {
   openOnCanvas(id: string, control?: "model" | "effort") {
     this.close()
     this.handlers.openOnCanvas(id, control)
+  }
+
+  /** Re-paint tiles when a loop starts/stops (no card event fires for that). */
+  refreshLoops() {
+    if (!this.open_) return
+    for (const t of this.tiles.values()) t.update()
+    this.renderCounts()
   }
 
   openBrowser(url?: string) {

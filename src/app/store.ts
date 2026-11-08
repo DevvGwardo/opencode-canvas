@@ -3,12 +3,13 @@
 import type { Backend, ConnectionState } from "./backend"
 import { basename, describeTool, lastAssistantText } from "./format"
 import { previewBlocks } from "./markdown"
-import type { FormInfo, Message, OcEvent, PermissionDecision, PermissionRequest, PermissionRule, Project, Session } from "./types"
+import type { FormInfo, Message, OcEvent, PermissionRequest, PermissionRule, Project, Session } from "./types"
 
 /** The rule that tells OpenCode to allow everything in a session. */
 export const ALLOW_ALL: PermissionRule = { action: "*", resource: "*", effect: "allow" }
 const isAllowAll = (r: PermissionRule) => r.action === "*" && r.resource === "*" && r.effect === "allow"
 const AUTO_KEY = "occ.autoApprove"
+const DISMISS_QUESTIONS_KEY = "occ.autoDismissQuestions"
 
 export interface Preview {
   text: string
@@ -74,28 +75,27 @@ export class Store {
   })()
   /** Called after the canvas approves something on your behalf. */
   onAutoApproved?: (req: PermissionRequest) => void
-  private approving = new Map<string, Promise<void>>()
-  private answeringForms = new Map<string, Promise<void>>()
-  private askVersions = new Map<string, number>()
-  private askSyncs = new Map<string, Promise<void>>()
-  private deletedSessions = new Set<string>()
-  private pendingAskSync?: Promise<void>
-  private pendingFormDiscovery?: Promise<void>
-  /** Last session `time.updated` seen per directory, to bound form discovery. */
-  private formScanUpdated = new Map<string, number>()
+  private approving = new Set<string>()
+  /** Dismiss new question forms automatically so sessions never sit in "Waiting for your answer". */
+  autoDismissQuestions = (() => {
+    try {
+      return localStorage.getItem(DISMISS_QUESTIONS_KEY) === "1"
+    } catch {
+      return false
+    }
+  })()
+  /** Called after the canvas dismisses a question on your behalf. */
+  onAutoDismissed?: (form: FormInfo) => void
+  private dismissing = new Set<string>()
 
   private listeners = new Set<Listener>()
   private dirtyCards = new Set<string>()
   private structureDirty = false
-  /** Set by stop(): after teardown nothing may touch the DOM or fetch again. */
-  private stopped = false
   private flushScheduled = false
-  private flushTimer?: ReturnType<typeof setTimeout>
   private previewQueue: string[] = []
   private previewQueued = new Set<string>()
   private previewInflight = 0
   private previewStale = new Set<string>()
-  private previewRetry = new Map<string, number>()
   private refreshTimers = new Map<string, ReturnType<typeof setTimeout>>()
   private unsubscribe?: () => void
   private pollTimer?: ReturnType<typeof setInterval>
@@ -110,7 +110,6 @@ export class Store {
   // ---- loading ------------------------------------------------------------
 
   async start() {
-    this.stopped = false
     this.unsubscribe = this.backend.subscribe(
       (ev) => this.onEvent(ev),
       (s) => {
@@ -138,14 +137,13 @@ export class Store {
         const cur = this.sessions.get(fresh.id)
         if (!cur) {
           if (!fresh.time.archived) {
-            this.deletedSessions.delete(fresh.id)
             this.sessions.set(fresh.id, fresh)
             structure = true
           }
           continue
         }
         if (fresh.time.archived) {
-          this.removeSession(fresh.id)
+          this.sessions.delete(fresh.id)
           structure = true
           continue
         }
@@ -156,74 +154,48 @@ export class Store {
           cur.title !== fresh.title ||
           cur.model?.id !== fresh.model?.id ||
           cur.model?.providerID !== fresh.model?.providerID ||
-          cur.model?.variant !== fresh.model?.variant ||
-          cur.time.updated !== fresh.time.updated ||
-          cur.parentID !== fresh.parentID ||
-          cur.projectID !== fresh.projectID ||
-          cur.location.directory !== fresh.location.directory ||
-          JSON.stringify(cur.permissions) !== JSON.stringify(fresh.permissions)
+          cur.model?.variant !== fresh.model?.variant
         if (changed) {
-          if (cur.title !== fresh.title || cur.parentID !== fresh.parentID || cur.projectID !== fresh.projectID || cur.location.directory !== fresh.location.directory) structure = true
-          this.touchParent(fresh.id)
+          if (cur.title !== fresh.title) structure = true
           this.sessions.set(fresh.id, { ...fresh, time: { ...fresh.time, viewed: Math.max(fresh.time.viewed ?? 0, cur.time.viewed ?? 0) || undefined } })
+          this.touchParent(fresh.id)
         }
       }
       if (structure) {
         this.rebuildChildren()
         this.markStructure()
       }
-      void this.discoverPendingForms()
     } catch {
       /* transient */
     }
   }
 
   stop() {
-    this.stopped = true
     this.unsubscribe?.()
     if (this.pollTimer) clearInterval(this.pollTimer)
     if (this.recentTimer) clearInterval(this.recentTimer)
-    if (this.flushTimer !== undefined) clearTimeout(this.flushTimer)
-    this.flushTimer = undefined
-    this.flushScheduled = false
-    // Give up any previews still waiting in the queue. In-flight ones finish,
-    // but markStructure/touchCard can no longer schedule a flush (see below).
-    this.previewQueue = []
-    this.previewQueued.clear()
-    for (const timer of this.refreshTimers.values()) clearTimeout(timer)
-    this.refreshTimers.clear()
   }
 
   async reload() {
     const [projects, sessions, active] = await Promise.all([
       this.backend.listProjects().catch(() => [] as Project[]),
       this.backend.listSessions(MAX_SESSIONS),
-      this.backend.active().catch(() => this.running),
+      this.backend.active().catch(() => new Set<string>()),
     ])
     this.projects = new Map(projects.map((p) => [p.id, p]))
-    for (const s of sessions) if (s.time.archived) this.removeSession(s.id)
-    this.sessions = new Map(sessions.filter((s) => !s.time.archived).map((s) => {
-      this.deletedSessions.delete(s.id)
-      const viewed = Math.max(s.time.viewed ?? 0, this.sessions.get(s.id)?.time.viewed ?? 0)
-      return [s.id, { ...s, time: { ...s.time, viewed: viewed || undefined } }]
-    }))
+    this.sessions = new Map(sessions.filter((s) => !s.time.archived).map((s) => [s.id, s]))
     this.rebuildChildren()
     this.running = active
     // Asks answered elsewhere while we were disconnected would otherwise stay
     // pending here forever, so recheck those as well as running sessions.
-    void this.syncPendingAsks()
-    void this.discoverPendingForms(true)
+    for (const id of new Set([...active, ...this.permissions.keys(), ...this.forms.keys()])) void this.syncAsks(id)
     this.previewStale = new Set(this.previews.keys())
     this.loaded = true
     this.markStructure()
   }
 
   addSessions(list: Session[]) {
-    for (const s of list) {
-      if (s.time.archived) continue
-      this.deletedSessions.delete(s.id)
-      this.sessions.set(s.id, s)
-    }
+    for (const s of list) this.sessions.set(s.id, s)
     this.rebuildChildren()
     this.markStructure()
   }
@@ -234,151 +206,27 @@ export class Store {
       const changed = new Set<string>()
       for (const id of active) if (!this.running.has(id)) changed.add(id)
       for (const id of this.running) if (!active.has(id)) changed.add(id)
+      if (!changed.size) return
       this.running = active
       for (const id of changed) {
         if (!active.has(id)) this.activity.delete(id)
-        this.touchParent(id)
+        this.touchCard(id)
       }
     } catch {
       /* transient */
     }
-    // A stable running set doesn't mean asks are unchanged. This also retries
-    // failed auto-approvals and catches replies missed by the event stream.
-    await this.syncPendingAsks()
   }
 
-  private syncPendingAsks(): Promise<void> {
-    if (this.pendingAskSync) return this.pendingAskSync
-    this.pendingAskSync = (async () => {
-      const ids = [...new Set([...this.running, ...this.permissions.keys(), ...this.forms.keys()])]
-      // Bound background traffic when many agents are active.
-      for (let i = 0; i < ids.length; i += 4) await Promise.all(ids.slice(i, i + 4).map((id) => this.syncAsks(id)))
-    })().finally(() => { this.pendingAskSync = undefined })
-    return this.pendingAskSync
-  }
-
-  /** Idle sessions can already have questions before this client subscribes. */
-  private discoverPendingForms(force = false): Promise<void> {
-    if (this.pendingFormDiscovery) return this.pendingFormDiscovery
-    this.pendingFormDiscovery = (async () => {
-      // Rescan a directory only once per change to its sessions. Without this,
-      // every 45s refresh issues one /api/form request per project directory.
-      // reload() forces a full sweep so nothing is missed after a reconnect.
-      const updatedByDirectory = new Map<string, number>()
-      for (const s of this.sessions.values()) {
-        const d = s.location.directory
-        if (d) updatedByDirectory.set(d, Math.max(updatedByDirectory.get(d) ?? 0, s.time.updated ?? 0))
-      }
-      const directories = [...new Set([
-        ...updatedByDirectory.keys(),
-        ...[...this.projects.values()].map((p) => p.canonical),
-      ].filter(Boolean))].filter((d) => force || this.formScanUpdated.get(d) !== (updatedByDirectory.get(d) ?? 0))
-      for (let i = 0; i < directories.length; i += 4) {
-        await Promise.all(directories.slice(i, i + 4).map(async (directory) => {
-          const versions = new Map(this.askVersions)
-          let forms: FormInfo[]
-          try {
-            forms = await this.backend.pendingForms(directory)
-          } catch {
-            // Leave the directory unscanned so a transient failure is retried.
-            return
-          }
-          this.formScanUpdated.set(directory, updatedByDirectory.get(directory) ?? 0)
-          for (const form of forms) {
-            const id = form.sessionID
-            if (this.deletedSessions.has(id) || (versions.get(id) ?? 0) !== (this.askVersions.get(id) ?? 0)) continue
-            if (!this.sessions.has(id)) {
-              const session = await this.backend.getSession(id).catch(() => undefined)
-              if (!session || session.time.archived || this.deletedSessions.has(id)) continue
-              this.addSessions([session])
-            }
-            if ((versions.get(id) ?? 0) !== (this.askVersions.get(id) ?? 0)) continue
-            const list = this.forms.get(id) ?? []
-            const next = [...list]
-            const index = next.findIndex((f) => f.id === form.id)
-            if (index < 0) next.push(form)
-            else next[index] = form
-            if (JSON.stringify(next) === JSON.stringify(list)) continue
-            // Merge only. Authoritative per-session reads clear answered forms.
-            this.forms.set(id, next)
-            this.asksChanged(id)
-            versions.set(id, this.askVersions.get(id)!)
-          }
-        }))
-      }
-    })().finally(() => { this.pendingFormDiscovery = undefined })
-    return this.pendingFormDiscovery
-  }
-
-  /** Coalesce readers and never replace newer events with an older snapshot. */
-  syncAsks(id: string): Promise<void> {
-    if (this.deletedSessions.has(id)) return Promise.resolve()
-    const current = this.askSyncs.get(id)
-    if (current) return current
-    const sync = (async () => {
-      while (true) {
-        const version = this.askVersions.get(id) ?? 0
-        let gone = 0
-        const ask = <T>(p: Promise<T[]>): Promise<T[] | undefined> =>
-          p.catch((e: unknown) => {
-            if ((e as { status?: number } | null)?.status === 404) gone++
-            return undefined
-          })
-        const [perms, forms] = await Promise.all([ask(this.backend.permissions(id)), ask(this.backend.forms(id))])
-        if (this.deletedSessions.has(id)) return
-        if (version !== (this.askVersions.get(id) ?? 0)) continue
-        // Both session-scoped endpoints 404 only when the session itself is
-        // gone. Drop its asks: a vanished session must not keep the "Allow
-        // all" chip up or re-poll the server every 15s forever.
-        if (gone === 2) {
-          this.setList(this.permissions, id, [])
-          this.setList(this.forms, id, [])
-          this.asksChanged(id)
-          return
-        }
-        const changed = perms !== undefined && JSON.stringify(perms) !== JSON.stringify(this.permissions.get(id) ?? [])
-          || forms !== undefined && JSON.stringify(forms) !== JSON.stringify(this.forms.get(id) ?? [])
-        // An unavailable endpoint must not erase a question or permission.
-        if (perms !== undefined) this.setList(this.permissions, id, perms)
-        if (forms !== undefined) this.setList(this.forms, id, forms)
-        if (changed) this.asksChanged(id)
-        this.touchParent(id)
-        for (const p of perms ?? []) this.maybeAutoApprove(p)
-        return
-      }
-    })().finally(() => { this.askSyncs.delete(id) })
-    this.askSyncs.set(id, sync)
-    return sync
-  }
-
-  private asksChanged(id: string) {
-    this.askVersions.set(id, (this.askVersions.get(id) ?? 0) + 1)
-    this.touchParent(id)
-  }
-
-  replyForm(form: FormInfo, answer: Record<string, unknown>) {
-    return this.resolveForm(form, () => this.backend.replyForm(form.sessionID, form.id, answer))
-  }
-
-  cancelForm(form: FormInfo) {
-    return this.resolveForm(form, () => this.backend.cancelForm(form.sessionID, form.id))
-  }
-
-  private resolveForm(form: FormInfo, fn: () => Promise<void>): Promise<void> {
-    const key = `${form.sessionID}/${form.id}`
-    const current = this.answeringForms.get(key)
-    if (current) return current
-    const reply = (async () => {
-      await fn()
-      this.clearForm(form.sessionID, form.id)
-    })().finally(() => { this.answeringForms.delete(key) })
-    this.answeringForms.set(key, reply)
-    return reply
-  }
-
-  private clearForm(id: string, formID: string) {
-    this.setList(this.forms, id, (this.forms.get(id) ?? []).filter((f) => f.id !== formID))
-    this.asksChanged(id)
+  private async syncAsks(id: string) {
+    const [perms, forms] = await Promise.all([
+      this.backend.permissions(id).catch(() => []),
+      this.backend.forms(id).catch(() => []),
+    ])
+    this.setList(this.permissions, id, perms)
+    this.setList(this.forms, id, forms)
+    this.touchCard(id)
+    for (const p of perms) this.maybeAutoApprove(p)
+    for (const f of forms) this.maybeAutoDismiss(f)
   }
 
   private setList<T>(map: Map<string, T[]>, id: string, list: T[]) {
@@ -444,42 +292,30 @@ export class Store {
   }
 
   isWorking(id: string): boolean {
-    for (const c of this.family(id)) if (this.running.has(c)) return true
+    if (this.running.has(id)) return true
+    for (const c of this.children.get(id) ?? []) if (this.running.has(c)) return true
     return false
   }
 
   needsInput(id: string): "permission" | "question" | undefined {
-    for (const c of this.family(id)) {
+    if (this.permissions.get(id)?.length) return "permission"
+    if (this.forms.get(id)?.length) return "question"
+    for (const c of this.children.get(id) ?? []) {
       if (this.permissions.get(c)?.length) return "permission"
       if (this.forms.get(c)?.length) return "question"
     }
     return undefined
   }
 
-  pendingInputSessions(id: string): string[] {
-    return [...this.family(id)].filter((sid) => this.permissions.get(sid)?.length || this.forms.get(sid)?.length)
-  }
-
   /** Short label for the card footer while the session works. */
   activityLabel(id: string): string {
     const own = this.activity.get(id)
-    for (const c of this.family(id)) {
+    if (own && this.running.has(id)) return own
+    for (const c of this.children.get(id) ?? []) {
       const a = this.activity.get(c)
       if (a && this.running.has(c)) return a
     }
     return own ?? "Working…"
-  }
-
-  private *family(id: string): Generator<string> {
-    const pending = [id]
-    const seen = new Set<string>()
-    while (pending.length) {
-      const next = pending.pop()!
-      if (seen.has(next)) continue
-      seen.add(next)
-      yield next
-      pending.push(...(this.children.get(next) ?? []))
-    }
   }
 
   /** Finished, and not looked at since it finished. */
@@ -506,8 +342,7 @@ export class Store {
     const counts: Record<Status, number> = { "needs-you": 0, working: 0, review: 0, failed: 0, stopped: 0, done: 0 }
     for (const s of this.roots()) {
       const st = this.status(s.id, now)
-      // Old failures you've already seen aren't news: they count as done here
-      // even though status() still reports "failed" for their quiet red label.
+      // Old failures you've already seen aren't news.
       if (st === "failed" && !(this.unseen(s.id) && now - (s.time.idle ?? 0) < REVIEW_WINDOW)) counts.done++
       else counts[st]++
     }
@@ -528,15 +363,11 @@ export class Store {
 
   /** This session (or its parent) carries the allow-everything rule. */
   sessionAutoApproves(id: string): boolean {
-    const seen = new Set<string>()
-    let current: string | undefined = id
-    while (current && !seen.has(current)) {
-      seen.add(current)
-      const session = this.sessions.get(current)
-      if (session?.permissions?.some(isAllowAll)) return true
-      current = session?.parentID
-    }
-    return false
+    const s = this.sessions.get(id)
+    if (!s) return false
+    if (s.permissions?.some(isAllowAll)) return true
+    const parent = s.parentID ? this.sessions.get(s.parentID) : undefined
+    return !!parent?.permissions?.some(isAllowAll)
   }
 
   pendingPermissionCount(): number {
@@ -547,34 +378,22 @@ export class Store {
 
   /** Reply "once" (no lasting rule) and drop it from the pending list. */
   async approve(req: PermissionRequest, auto = false) {
-    const approved = await this.replyPermission(req, "once")
-    if (auto && approved) this.onAutoApproved?.(req)
-    return approved
-  }
-
-  async replyPermission(req: PermissionRequest, decision: PermissionDecision): Promise<boolean> {
-    const key = `${req.sessionID}/${req.id}`
-    const current = this.approving.get(key)
-    if (current) {
-      await current
-      return false
-    }
-    const reply = (async () => {
-      await this.backend.replyPermission(req.sessionID, req.id, decision)
+    if (this.approving.has(req.id)) return
+    this.approving.add(req.id)
+    try {
+      await this.backend.replyPermission(req.sessionID, req.id, "once")
       this.setList(this.permissions, req.sessionID, (this.permissions.get(req.sessionID) ?? []).filter((p) => p.id !== req.id))
-      this.asksChanged(req.sessionID)
-    })().finally(() => { this.approving.delete(key) })
-    this.approving.set(key, reply)
-    await reply
-    return true
+      this.touchParent(req.sessionID)
+      if (auto) this.onAutoApproved?.(req)
+    } finally {
+      this.approving.delete(req.id)
+    }
   }
 
   async approveAllPending(sessionID?: string): Promise<number> {
-    const reqs = sessionID
-      ? [...this.family(sessionID)].flatMap((id) => this.permissions.get(id) ?? [])
-      : [...this.permissions.values()].flat()
+    const reqs = sessionID ? [...(this.permissions.get(sessionID) ?? [])] : [...this.permissions.values()].flat()
     const results = await Promise.allSettled(reqs.map((r) => this.approve(r)))
-    return results.filter((r) => r.status === "fulfilled" && r.value).length
+    return results.filter((r) => r.status === "fulfilled").length
   }
 
   setAutoApproveAll(on: boolean) {
@@ -592,9 +411,6 @@ export class Store {
   async setSessionAutoApprove(id: string, on: boolean) {
     const s = this.sessions.get(id)
     if (!s) return
-    if (!on && s.parentID && this.sessionAutoApproves(s.parentID)) {
-      throw new Error("Auto-approve is inherited from a parent session. Turn it off there.")
-    }
     const rest = (s.permissions ?? []).filter((r) => !isAllowAll(r))
     const rules = on ? [...rest, ALLOW_ALL] : rest
     await this.backend.setSessionPermissions(id, rules.length ? rules : null)
@@ -605,6 +421,49 @@ export class Store {
 
   private maybeAutoApprove(req: PermissionRequest) {
     if (this.autoApproveAll || this.sessionAutoApproves(req.sessionID)) void this.approve(req, true).catch(() => {})
+  }
+
+  // ---- questions -----------------------------------------------------------
+
+  pendingQuestionCount(): number {
+    let n = 0
+    for (const list of this.forms.values()) n += list.length
+    return n
+  }
+
+  /** Dismiss a question form and drop it from the pending list. */
+  async dismissForm(form: FormInfo, auto = false) {
+    if (this.dismissing.has(form.id)) return
+    this.dismissing.add(form.id)
+    try {
+      await this.backend.cancelForm(form.sessionID, form.id)
+      this.setList(this.forms, form.sessionID, (this.forms.get(form.sessionID) ?? []).filter((f) => f.id !== form.id))
+      this.touchParent(form.sessionID)
+      if (auto) this.onAutoDismissed?.(form)
+    } finally {
+      this.dismissing.delete(form.id)
+    }
+  }
+
+  async dismissAllPendingForms(sessionID?: string): Promise<number> {
+    const forms = sessionID ? [...(this.forms.get(sessionID) ?? [])] : [...this.forms.values()].flat()
+    const results = await Promise.allSettled(forms.map((f) => this.dismissForm(f)))
+    return results.filter((r) => r.status === "fulfilled").length
+  }
+
+  setAutoDismissQuestions(on: boolean) {
+    this.autoDismissQuestions = on
+    try {
+      localStorage.setItem(DISMISS_QUESTIONS_KEY, on ? "1" : "0")
+    } catch {
+      /* private mode */
+    }
+    if (on) void this.dismissAllPendingForms()
+    for (const id of this.forms.keys()) this.touchParent(id)
+  }
+
+  private maybeAutoDismiss(form: FormInfo) {
+    if (this.autoDismissQuestions) void this.dismissForm(form, true).catch(() => {})
   }
 
   /** Tell OpenCode you've seen this session's latest result (syncs to other clients). */
@@ -626,9 +485,7 @@ export class Store {
 
   /** Ask for a card's preview; cheap to call every frame for visible cards. */
   wantPreview(id: string) {
-    if (this.stopped) return
     if (this.previews.has(id) && !this.previewStale.has(id)) return
-    if ((this.previewRetry.get(id) ?? 0) > Date.now()) return
     if (this.previewQueued.has(id)) return
     this.previewQueued.add(id)
     this.previewQueue.push(id)
@@ -639,11 +496,6 @@ export class Store {
     while (this.previewInflight < PREVIEW_CONCURRENCY && this.previewQueue.length) {
       // Newest requests first: those are the cards on screen right now.
       const id = this.previewQueue.pop()!
-      // A session deleted while its preview waited needs no fetch.
-      if (this.deletedSessions.has(id)) {
-        this.previewQueued.delete(id)
-        continue
-      }
       this.previewInflight++
       this.loadPreview(id).finally(() => {
         this.previewInflight--
@@ -656,15 +508,11 @@ export class Store {
   private async loadPreview(id: string) {
     try {
       const page = await this.backend.messages(id, 16)
-      if (this.deletedSessions.has(id)) return
-      this.previewRetry.delete(id)
       this.previewStale.delete(id)
       this.previews.set(id, buildPreview(page.data))
       this.touchCard(id)
     } catch {
-      if (this.deletedSessions.has(id)) return
-      this.previewStale.add(id)
-      this.previewRetry.set(id, Date.now() + 5_000)
+      if (!this.previews.has(id)) this.previews.set(id, { text: "", bullets: [] })
     }
   }
 
@@ -687,7 +535,6 @@ export class Store {
     const id: string | undefined = d.sessionID
     switch (ev.type) {
       case "session.created": {
-        this.deletedSessions.delete(d.sessionID)
         const s: Session = {
           id: d.sessionID,
           parentID: d.parentID,
@@ -720,8 +567,7 @@ export class Store {
         break
       }
       case "session.deleted":
-        if (id) {
-          this.removeSession(id)
+        if (id && this.sessions.delete(id)) {
           this.rebuildChildren()
           this.markStructure()
         }
@@ -735,9 +581,7 @@ export class Store {
           this.backend
             .getSession(id)
             .then((s) => {
-              if (!this.sessions.has(id)) return
               this.sessions.set(id, s)
-              this.rebuildChildren()
               this.markStructure()
             })
             .catch(() => {})
@@ -777,7 +621,7 @@ export class Store {
       case "session.text.delta":
         if (!id) break
         this.liveText.set(id, ((this.liveText.get(id) ?? "") + (d.delta ?? "")).slice(-600))
-        this.touchParent(id)
+        this.touchCard(id)
         break
       case "session.text.ended":
         if (id) this.refreshPreviewSoon(id, 300)
@@ -796,6 +640,14 @@ export class Store {
         break
       case "session.compaction.started":
         this.setActivity(id, "Compacting context…")
+        break
+      case "session.compaction.ended":
+      case "session.compaction.failed":
+        // The compaction is over (either way); stop saying we're compacting.
+        if (id && this.activity.get(id) === "Compacting context…") {
+          this.activity.delete(id)
+          this.touchCard(id)
+        }
         break
       case "session.retry.scheduled":
         this.setActivity(id, "Retrying…")
@@ -821,15 +673,12 @@ export class Store {
         )
         break
       case "permission.asked":
-        // A malformed payload must never enter the pending list: syncAsks
-        // compares against the server snapshot and would never converge.
-        if (id && typeof d.id === "string" && typeof d.action === "string" && Array.isArray(d.resources)) {
-          const req = { ...(d as PermissionRequest), sessionID: id }
-          const list = (this.permissions.get(id) ?? []).filter((p) => p.id !== req.id)
-          list.push(req)
+        if (id) {
+          const list = (this.permissions.get(id) ?? []).filter((p) => p.id !== d.id)
+          list.push(d as PermissionRequest)
           this.permissions.set(id, list)
-          this.asksChanged(id)
-          this.maybeAutoApprove(req)
+          this.touchParent(id)
+          this.maybeAutoApprove(d as PermissionRequest)
         }
         break
       case "permission.replied":
@@ -839,31 +688,26 @@ export class Store {
             id,
             (this.permissions.get(id) ?? []).filter((p) => p.id !== (d.requestID ?? d.id)),
           )
-          this.asksChanged(id)
           // Payloads differ by version; confirm against the server.
           void this.syncAsks(id)
+          this.touchParent(id)
         }
         break
       case "form.created":
       case "question.asked":
-        if (id) {
-          const form = d.form ?? d
-          if (typeof form.id === "string" && Array.isArray(form.fields)) {
-            this.forms.set(id, [...(this.forms.get(id) ?? []).filter((f) => f.id !== form.id), { ...form, sessionID: id }])
-          }
-          this.asksChanged(id)
-          void this.syncAsks(id)
-        }
-        break
       case "form.replied":
       case "form.cancelled":
       case "question.replied":
-      case "question.rejected":
-        if (id) {
-          this.clearForm(id, d.formID ?? d.requestID ?? d.id)
-          void this.syncAsks(id)
+      case "question.rejected": {
+        // form.created nests the form under `data.form`, so the session is not
+        // on the event itself; the others carry it directly.
+        const ask = d.sessionID ?? d.form?.sessionID
+        if (ask) {
+          void this.syncAsks(ask)
+          this.touchParent(ask)
         }
         break
+      }
     }
     for (const l of this.listeners) l.event?.(ev)
   }
@@ -879,33 +723,9 @@ export class Store {
   }
 
   private touchParent(id: string) {
-    const seen = new Set<string>()
-    let current: string | undefined = id
-    while (current && !seen.has(current)) {
-      seen.add(current)
-      this.touchCard(current)
-      current = this.sessions.get(current)?.parentID
-    }
-  }
-
-  private removeSession(id: string) {
-    this.touchParent(id)
-    this.deletedSessions.add(id)
-    this.sessions.delete(id)
-    this.running.delete(id)
-    this.activity.delete(id)
-    this.previews.delete(id)
-    this.liveText.delete(id)
-    this.permissions.delete(id)
-    this.forms.delete(id)
-    this.previewStale.delete(id)
-    this.previewRetry.delete(id)
-    clearTimeout(this.refreshTimers.get(id))
-    this.refreshTimers.delete(id)
-    this.asksChanged(id)
-    // Bump first (to invalidate any in-flight ask sync), then drop the version
-    // entry so a deleted session doesn't accumulate one per id for the tab's life.
-    this.askVersions.delete(id)
+    this.touchCard(id)
+    const parent = this.sessions.get(id)?.parentID
+    if (parent) this.touchCard(parent)
   }
 
   private patch(id: string | undefined, fn: (s: Session) => void, structural: boolean) {
@@ -930,17 +750,13 @@ export class Store {
   }
 
   private scheduleFlush() {
-    // After stop() a late event (or an in-flight preview) must not re-arm the
-    // timer and notify listeners on a torn-down store.
-    if (this.stopped || this.flushScheduled) return
+    if (this.flushScheduled) return
     this.flushScheduled = true
     // Next frame when visible; the timer covers background tabs, where frames
     // don't run but the tab title and counts must keep updating.
     const run = () => {
       if (!this.flushScheduled) return
       this.flushScheduled = false
-      if (this.flushTimer !== undefined) clearTimeout(this.flushTimer)
-      this.flushTimer = undefined
       if (this.structureDirty) {
         this.structureDirty = false
         for (const l of this.listeners) l.structure?.()
@@ -952,7 +768,7 @@ export class Store {
       }
     }
     if (typeof requestAnimationFrame === "function") requestAnimationFrame(run)
-    this.flushTimer = setTimeout(run, 300)
+    setTimeout(run, 300)
   }
 }
 

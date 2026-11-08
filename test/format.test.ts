@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { describeTool, matchesQuery, shellQuote, summarizeTools, timeAgo, toolRow } from "../src/app/format"
+import { basename, compactionLabel, describeTool, matchesQuery, shellQuote, summarizeTools, timeAgo, toolRow } from "../src/app/format"
 import { previewBlocks, renderMarkdown } from "../src/app/markdown"
 import { buildPreview } from "../src/app/store"
 import type { Message } from "../src/app/types"
@@ -30,6 +30,15 @@ describe("summarizeTools", () => {
   })
 })
 
+describe("compactionLabel", () => {
+  test("reflects the compaction lifecycle, not just its existence", () => {
+    expect(compactionLabel({ status: "running" })).toBe("Compacting context…")
+    expect(compactionLabel({ status: "completed" })).toBe("Context compacted")
+    expect(compactionLabel({ status: "failed" })).toBe("Compaction failed")
+    expect(compactionLabel({})).toBe("Context compacted")
+  })
+})
+
 describe("tool labels", () => {
   test("present tense for cards", () => {
     expect(describeTool("read", { path: "/x/web/sessions.ts" })).toBe("Reading sessions.ts…")
@@ -42,6 +51,17 @@ describe("tool labels", () => {
   test("past tense rows", () => {
     expect(toolRow("read", { path: "web/a.ts" })).toEqual(["Read", "web/a.ts"])
     expect(toolRow("shell", { command: "bun test" })).toEqual(["Ran", "bun test"])
+  })
+})
+
+describe("basename", () => {
+  test("handles unix and windows separators", () => {
+    expect(basename("/code/app")).toBe("app")
+    expect(basename("/code/app/")).toBe("app")
+    expect(basename("C:\\Users\\torre\\clones\\hermesworld")).toBe("hermesworld")
+    expect(basename("C:\\Users\\torre\\clones\\hermesworld\\")).toBe("hermesworld")
+    expect(basename("/")).toBe("/")
+    expect(basename(undefined)).toBe("")
   })
 })
 

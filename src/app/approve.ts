@@ -5,6 +5,7 @@ import type { Store } from "./store"
 import { toast } from "./toast"
 
 const toggles = new Set<HTMLButtonElement>()
+const dismissToggles = new Set<HTMLButtonElement>()
 
 function paint(store: Store) {
   for (const b of toggles) {
@@ -59,6 +60,49 @@ export function autoApprovedNotices(store: Store) {
     clearTimeout(timer)
     timer = setTimeout(() => {
       toast(batch.length === 1 ? `Auto-approved ${batch[0]}` : `Auto-approved ${batch.length} requests`)
+      batch = []
+    }, 600)
+  }
+}
+
+function paintDismiss(store: Store) {
+  for (const b of dismissToggles) {
+    b.classList.toggle("on", store.autoDismissQuestions)
+    b.querySelector(".aa-label")!.textContent = store.autoDismissQuestions ? "Dismissing questions" : "Dismiss questions"
+    b.setAttribute("aria-pressed", String(store.autoDismissQuestions))
+    b.title = store.autoDismissQuestions
+      ? "Automatically dismissing question prompts while this page is open. Click to stop."
+      : "Automatically dismiss question prompts instead of waiting for your answer (while this page is open)"
+  }
+}
+
+export function autoDismissToggle(store: Store): HTMLButtonElement {
+  const b = document.createElement("button")
+  b.className = "aa-toggle dismiss"
+  b.innerHTML = `<span class="aa-dot" aria-hidden="true"></span><span class="aa-label"></span>`
+  b.addEventListener("click", () => {
+    const on = !store.autoDismissQuestions
+    store.setAutoDismissQuestions(on)
+    toast(on ? "Won't wait for answers: dismissing new questions" : "Questions will wait for you again")
+    paintDismiss(store)
+  })
+  dismissToggles.add(b)
+  paintDismiss(store)
+  return b
+}
+
+/** Batch "dismissed X" notices so a burst of questions shows one toast. */
+export function autoDismissedNotices(store: Store) {
+  let batch: string[] = []
+  let timer: ReturnType<typeof setTimeout> | undefined
+  store.onAutoDismissed = (form) => {
+    const s = store.sessions.get(form.sessionID)
+    const where = s ? store.projectLabel(s) : "a session"
+    const what = form.title || "question"
+    batch.push(`${what.length > 48 ? what.slice(0, 47) + "…" : what} (${where})`)
+    clearTimeout(timer)
+    timer = setTimeout(() => {
+      toast(batch.length === 1 ? `Dismissed ${batch[0]}` : `Dismissed ${batch.length} questions`)
       batch = []
     }, 600)
   }

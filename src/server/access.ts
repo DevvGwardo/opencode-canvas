@@ -1,7 +1,7 @@
 // Canvas authentication is separate from the OpenCode service credentials.
 
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto"
-import { networkInterfaces } from "node:os"
+import { hostname, networkInterfaces } from "node:os"
 
 const COOKIE = "occ_session"
 const SESSION_MS = 12 * 3600_000
@@ -29,10 +29,65 @@ export function isLoopback(host: string) {
   return name === "127.0.0.1" || name === "localhost" || name === "::1"
 }
 
+/**
+ * Origins compare by their parsed serialization, so scheme and host case never
+ * matter (a browser may send `http://MY-MAC.local:4317` for a lowercase URL).
+ */
+function sameOrigin(value: string, ...allowed: Array<string | undefined>) {
+  let origin: string
+  try {
+    origin = new URL(value).origin
+  } catch {
+    return false
+  }
+  return allowed.some((candidate) => {
+    if (!candidate) return false
+    try {
+      return new URL(candidate).origin === origin
+    } catch {
+      return false
+    }
+  })
+}
+
 export function networkAddresses() {
   return Object.values(networkInterfaces()).flatMap((entries) =>
     (entries ?? []).filter((entry) => !entry.internal && !entry.address.includes("%")).map((entry) => entry.address),
   )
+}
+
+export type AddressKind = "lan" | "vpn" | "virtual"
+
+export interface LocalAddress {
+  address: string
+  adapter: string
+  kind: AddressKind
+}
+
+/** Adapters a browser on another PC can never reach: VM switches and tunnels. */
+const VPN_ADAPTER = /tailscale|zerotier|hamachi|wireguard|openvpn|nordvpn|windscribe|radmin|vpn/i
+const VIRTUAL_ADAPTER = /vEthernet|hyper-?v|wsl|virtualbox|vmware|docker|virtual|loopback|bluetooth|pseudo|tap|npcap/i
+
+const ADDRESS_RANK: Record<AddressKind, number> = { lan: 0, vpn: 1, virtual: 2 }
+
+/**
+ * The host's own addresses, best first. `networkAddresses()` deliberately keeps
+ * every address (the Host allowlist wants them all), but printing virtual
+ * switches and VPN tunnels as "network" URLs sends people to dead ends, so this
+ * orders real LAN interfaces first and labels the rest.
+ */
+export function classifyAddresses(
+  interfaces: Record<string, ReadonlyArray<{ address: string; family: string | number; internal: boolean }> | undefined> = networkInterfaces(),
+): LocalAddress[] {
+  const listed: LocalAddress[] = []
+  for (const [adapter, entries] of Object.entries(interfaces)) {
+    for (const entry of entries ?? []) {
+      if (entry.internal || entry.address.includes("%") || entry.address.startsWith("169.254.")) continue
+      const kind: AddressKind = VPN_ADAPTER.test(adapter) ? "vpn" : VIRTUAL_ADAPTER.test(adapter) ? "virtual" : "lan"
+      listed.push({ address: entry.address, adapter, kind })
+    }
+  }
+  return listed.sort((a, b) => ADDRESS_RANK[a.kind] - ADDRESS_RANK[b.kind])
 }
 
 function digest(value: string) {
@@ -55,9 +110,15 @@ export function createAccess(opts: AccessOptions) {
   const hosts = new Set(["localhost", "127.0.0.1", "::1"])
   if (publicOrigin) hosts.add(hostName(publicOrigin.host)!)
   if (!loopbackOnly) {
-    for (const value of [opts.hostname, ...networkAddresses(), ...(opts.allowedHosts ?? [])]) {
+    // Another PC on the LAN usually reaches this host by name, not by IP, so
+    // the machine's own name is allowed without --allow-host.
+    const self = hostname()
+    for (const value of [opts.hostname, ...networkAddresses(), self, `${self}.local`, ...(opts.allowedHosts ?? [])]) {
       const name = hostName(value)
-      if (!name) throw new Error(`Invalid allowed host: ${value}`)
+      if (!name) {
+        if (value === self || value === `${self}.local`) continue
+        throw new Error(`Invalid allowed host: ${value}`)
+      }
       if (name !== "0.0.0.0" && name !== "::") hosts.add(name)
     }
   }
@@ -85,7 +146,7 @@ export function createAccess(opts: AccessOptions) {
     const host = hostName(req.headers.get("host") ?? "")
     if (!host || !hosts.has(host)) return new Response("Forbidden host", { status: 403 })
     const origin = req.headers.get("origin")
-    if (origin && origin !== url.origin && origin !== publicOrigin?.origin) return new Response("Forbidden origin", { status: 403 })
+    if (origin && !sameOrigin(origin, url.origin, publicOrigin?.origin)) return new Response("Forbidden origin", { status: 403 })
     const site = req.headers.get("sec-fetch-site")
     if (site && site !== "same-origin" && site !== "none") return new Response("Forbidden", { status: 403 })
     if (requireAuth && !authenticated(req)) return Response.json({ message: "Sign in to Canvas" }, { status: 401 })

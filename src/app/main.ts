@@ -6,10 +6,11 @@ import { DemoBackend } from "./demo"
 import { LAYOUTS, type LayoutName } from "./layouts"
 import { ensureAccess } from "./login"
 import { defaultModel } from "./models"
+import { LoopManager } from "./loops"
 import { SessionPanel } from "./panel"
 import { NewSessionPicker } from "./picker"
 import { TilesView } from "./tiles"
-import { autoApproveToggle, autoApprovedNotices } from "./approve"
+import { autoApproveToggle, autoApprovedNotices, autoDismissToggle, autoDismissedNotices } from "./approve"
 import { SPINNERS, setSpinnerStyle, spinner, type SpinnerStyle } from "./spinners"
 import { ALLOW_ALL, STATUS_LABEL, Store, type Status } from "./store"
 import { toast } from "./toast"
@@ -123,6 +124,7 @@ async function boot() {
 
   const backend: Backend = demo ? new DemoBackend() : new LiveBackend()
   const store = new Store(backend)
+  const loops = new LoopManager(store, backend)
 
   root.replaceChildren()
   root.classList.add("ready")
@@ -145,12 +147,14 @@ async function boot() {
   canvas.setLayout(layoutName)
   root.dataset.layout = layoutName
   // Handy from the devtools console.
-  ;(window as any).opencodeCanvas = { canvas, store, browser }
+  ;(window as any).opencodeCanvas = { canvas, store, browser, loops }
 
   panel = new SessionPanel(root, store, backend, canvas, () => {
     root.classList.remove("panel-open")
     if (location.hash) history.replaceState(null, "", location.pathname + location.search)
   }, (url) => browser.open(url))
+  panel.loops = loops
+  loops.onChange(() => panel.refreshLoop())
 
   function openSession(id: string) {
     const from = canvas.cardRect(id)
@@ -192,6 +196,8 @@ async function boot() {
     },
   })
   panel.tiles = tiles
+  tiles.loops = loops
+  loops.onChange(() => tiles.refreshLoops())
   function openTiles() {
     if (panel.isOpen) panel.close()
     tiles.open()
@@ -276,7 +282,7 @@ async function boot() {
   tilesBtn.innerHTML = `<span class="tiles-icon" aria-hidden="true"></span><span class="tiles-label">Tiles</span><span class="tiles-n"></span>`
   tilesBtn.title = "Every running session's chat, side by side (T)"
   tilesBtn.addEventListener("click", () => (tiles.isOpen ? tiles.close() : openTiles()))
-  right.append(autoApproveToggle(store), tilesBtn)
+  right.append(autoApproveToggle(store), autoDismissToggle(store), tilesBtn)
   browserBtn = el("button", "tiles-open-btn", "Browser") as HTMLButtonElement
   browserBtn.classList.add("browser-open-btn")
   browserBtn.innerHTML = `<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" aria-hidden="true"><rect x="1.5" y="2" width="13" height="12" rx="2"/><path d="M1.5 5.5h13M4 3.7h.1M6 3.7h.1"/></svg><span class="browser-label">Browser</span>`
@@ -285,6 +291,7 @@ async function boot() {
   browserBtn.addEventListener("click", () => browser.isOpen ? browser.close() : browser.open())
   right.append(browserBtn)
   autoApprovedNotices(store)
+  autoDismissedNotices(store)
   const newBtn = el("button", "new-btn") as HTMLButtonElement
   newBtn.innerHTML = `<span class="plus">+</span><span class="new-label">New session</span>`
   newBtn.title = "New session (N)"
@@ -435,6 +442,7 @@ async function boot() {
         <dt>⇧ Enter</dt><dd>New line</dd>
         <dt>⌘ .</dt><dd>Stop</dd>
         <dt>/help</dt><dd>Slash commands, including project-specific OpenCode commands</dd>
+        <dt>/loop …</dt><dd>Re-prompt this session when idle (/stoploop to stop)</dd>
         <dt>/effort high</dt><dd>Change model effort (/effort opens the picker)</dd>
         <dt>/browser URL</dt><dd>Browse a URL on the host computer</dd>
       </dl>`
