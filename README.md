@@ -142,7 +142,24 @@ export CANVAS_PASSWORD
 opencode-canvas --lan --open
 ```
 
-Open one of the printed `network` URLs on another device and sign in. OpenCode itself can stay bound to loopback. To use a custom local hostname, add `--allow-host my-computer.local`; repeat the flag for additional names.
+Open one of the printed `network` URLs on another device and sign in. OpenCode itself can stay bound to loopback.
+
+Canvas prints its addresses grouped, because not every address a host has is reachable from another PC:
+
+```
+  network http://192.168.1.199:4317
+  vpn     http://100.107.134.78:4317  (Tailscale)
+  virtual http://172.28.96.1:4317  (vEthernet (WSL))
+  name    http://DESKTOP-UL6UVKB:4317
+```
+
+Use a `network` URL from a PC on the same LAN. `vpn` addresses only work for devices on that VPN, and `virtual` addresses belong to Hyper-V/WSL/VM switches that no other machine can reach. The `name` URL works too: this host's own name is always accepted, so `--allow-host` is only needed for *other* names (for example `--allow-host my-computer.local`, repeatable).
+
+If the other PC can't reach Canvas at all — no page, not even a sign-in prompt — a host firewall is blocking the port. Windows normally prompts on first run, but a rule scoped to one network profile won't apply after Windows recategorizes the network (Private vs Public). Allow inbound TCP 4317 from an elevated shell:
+
+```powershell
+New-NetFirewallRule -DisplayName 'opencode-canvas' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 4317 -Profile Any
+```
 
 Canvas logins expire after 12 hours or a server restart. **Sign out** revokes that login. Setting `CANVAS_PASSWORD` also enables login for loopback-only use.
 
@@ -198,10 +215,16 @@ Type `/` in either composer, or click its `/` button. Arrow keys select a comman
 | `/effort default` | Restore OpenCode's configured effort |
 | `/compact` | Compact session context using OpenCode's native API |
 | `/stop` | Interrupt the current session |
+| `/loop <prompt> [--count N] [--delay Ms] [--stop TEXT]` | Re-prompt this session each time it goes idle, up to N iterations |
+| `/stoploop` | Stop looping this session |
 | `/browser` / `/browser http://localhost:3000` | Open the integrated browser, optionally at a URL |
 | `/init`, `/review`, custom commands | Execute commands registered in the current project |
 
 Canvas controls take precedence over identically named project commands. TUI-only commands that aren't exposed by OpenCode's command registry or listed above aren't emulated.
+
+### Session loops
+
+Click **Loop** in a session header (or `⟳` on a tile) to keep a session working on its own: Canvas re-sends your loop prompt each time the run goes idle, up to the configured iteration count (default 10, max 200) with a delay between runs (default 3s). The loop pauses while the session works or waits on a permission/question, stops early when the latest reply contains your stop phrase (e.g. `--stop DONE`), and stops on a failed run unless `--continue-on-error` is given. Pressing **Stop** ends the loop as well, so Canvas never restarts work you just killed. Loop state survives page reloads; iteration counts carry over so `--count` stays bounded.
 
 ### Integrated browser
 
@@ -263,7 +286,7 @@ CLI arguments supported by `opencode-canvas`:
 | `-p, --port <port>` | `4317` | Port to listen on. Pass `0` to pick a random available port. |
 | `--hostname <host>` | `127.0.0.1` | Network interface to bind. Non-loopback bindings require `CANVAS_PASSWORD`. |
 | `--lan` | `false` | Bind to `0.0.0.0` for authenticated local-network access. |
-| `--allow-host <host>` | Local interface addresses | Allow a custom LAN hostname in addition to loopback and local IPs. Repeatable. |
+| `--allow-host <host>` | Local interface addresses | Allow an additional LAN hostname. Loopback, local IPs, and this host's own name are always allowed. Repeatable. |
 | `--origin <url>` | Unset | Exact public HTTP(S) origin for a trusted reverse proxy; requires `CANVAS_PASSWORD`. HTTPS enables Secure login cookies. |
 | `--browser-bin <path>` | Auto-detected | Absolute Chrome/Chromium executable path; also configurable with `CANVAS_BROWSER_BIN`. |
 | `--no-browser` | `false` | Disable the integrated browser. |

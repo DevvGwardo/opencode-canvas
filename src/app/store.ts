@@ -9,6 +9,7 @@ import type { FormInfo, Message, OcEvent, PermissionRequest, PermissionRule, Pro
 export const ALLOW_ALL: PermissionRule = { action: "*", resource: "*", effect: "allow" }
 const isAllowAll = (r: PermissionRule) => r.action === "*" && r.resource === "*" && r.effect === "allow"
 const AUTO_KEY = "occ.autoApprove"
+const DISMISS_QUESTIONS_KEY = "occ.autoDismissQuestions"
 
 export interface Preview {
   text: string
@@ -75,6 +76,17 @@ export class Store {
   /** Called after the canvas approves something on your behalf. */
   onAutoApproved?: (req: PermissionRequest) => void
   private approving = new Set<string>()
+  /** Dismiss new question forms automatically so sessions never sit in "Waiting for your answer". */
+  autoDismissQuestions = (() => {
+    try {
+      return localStorage.getItem(DISMISS_QUESTIONS_KEY) === "1"
+    } catch {
+      return false
+    }
+  })()
+  /** Called after the canvas dismisses a question on your behalf. */
+  onAutoDismissed?: (form: FormInfo) => void
+  private dismissing = new Set<string>()
 
   private listeners = new Set<Listener>()
   private dirtyCards = new Set<string>()
@@ -214,6 +226,7 @@ export class Store {
     this.setList(this.forms, id, forms)
     this.touchCard(id)
     for (const p of perms) this.maybeAutoApprove(p)
+    for (const f of forms) this.maybeAutoDismiss(f)
   }
 
   private setList<T>(map: Map<string, T[]>, id: string, list: T[]) {
@@ -408,6 +421,49 @@ export class Store {
 
   private maybeAutoApprove(req: PermissionRequest) {
     if (this.autoApproveAll || this.sessionAutoApproves(req.sessionID)) void this.approve(req, true).catch(() => {})
+  }
+
+  // ---- questions -----------------------------------------------------------
+
+  pendingQuestionCount(): number {
+    let n = 0
+    for (const list of this.forms.values()) n += list.length
+    return n
+  }
+
+  /** Dismiss a question form and drop it from the pending list. */
+  async dismissForm(form: FormInfo, auto = false) {
+    if (this.dismissing.has(form.id)) return
+    this.dismissing.add(form.id)
+    try {
+      await this.backend.cancelForm(form.sessionID, form.id)
+      this.setList(this.forms, form.sessionID, (this.forms.get(form.sessionID) ?? []).filter((f) => f.id !== form.id))
+      this.touchParent(form.sessionID)
+      if (auto) this.onAutoDismissed?.(form)
+    } finally {
+      this.dismissing.delete(form.id)
+    }
+  }
+
+  async dismissAllPendingForms(sessionID?: string): Promise<number> {
+    const forms = sessionID ? [...(this.forms.get(sessionID) ?? [])] : [...this.forms.values()].flat()
+    const results = await Promise.allSettled(forms.map((f) => this.dismissForm(f)))
+    return results.filter((r) => r.status === "fulfilled").length
+  }
+
+  setAutoDismissQuestions(on: boolean) {
+    this.autoDismissQuestions = on
+    try {
+      localStorage.setItem(DISMISS_QUESTIONS_KEY, on ? "1" : "0")
+    } catch {
+      /* private mode */
+    }
+    if (on) void this.dismissAllPendingForms()
+    for (const id of this.forms.keys()) this.touchParent(id)
+  }
+
+  private maybeAutoDismiss(form: FormInfo) {
+    if (this.autoDismissQuestions) void this.dismissForm(form, true).catch(() => {})
   }
 
   /** Tell OpenCode you've seen this session's latest result (syncs to other clients). */

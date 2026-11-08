@@ -2,6 +2,11 @@ import { afterAll, describe, expect, test } from "bun:test"
 import { createServer } from "node:net"
 import { startServer } from "../src/server/server"
 
+// createAccess() falls back to process.env.CANVAS_PASSWORD, so a developer who
+// exports it for real LAN use would otherwise get 401s from every
+// unauthenticated request in this file.
+delete process.env.CANVAS_PASSWORD
+
 // A stand-in OpenCode server that records what the proxy sends it.
 const seen: Array<{ path: string; auth: string | null; origin: string | null }> = []
 let heldEvent: ReadableStreamDefaultController<Uint8Array> | undefined

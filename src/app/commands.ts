@@ -9,6 +9,8 @@ export const CANVAS_COMMANDS: CommandOption[] = [
   { name: "effort", description: "Choose model effort, or /effort high" },
   { name: "compact", description: "Compact the session context" },
   { name: "stop", description: "Interrupt this session" },
+  { name: "loop", description: "Loop this session: /loop <prompt> [--count N] [--delay Ms] [--stop TEXT]" },
+  { name: "stoploop", description: "Stop looping this session" },
   { name: "browser", description: "Open the browser, optionally with a URL" },
 ]
 
@@ -22,14 +24,18 @@ export async function runCanvasCommand(
     effort(variant?: string): unknown
     compact(): unknown
     stop(): unknown
+    loop?(args?: string): unknown
+    stoploop?(): unknown
     browser(url?: string): unknown
   },
 ): Promise<boolean> {
   const command = parseCommand(text)
   if (!command || !CANVAS_COMMANDS.some((c) => c.name === command.name)) return false
   const name = command.name as keyof typeof handlers
-  if (command.text && name !== "effort" && name !== "browser") throw new Error(`/${name} doesn't take arguments`)
-  await handlers[name](command.text || undefined)
+  const fn = handlers[name]
+  if (!fn) throw new Error(`/${command.name} isn't available here`)
+  if (command.text && name !== "effort" && name !== "browser" && name !== "loop") throw new Error(`/${name} doesn't take arguments`)
+  await (fn as (arg?: string) => unknown)(command.text || undefined)
   return true
 }
 
