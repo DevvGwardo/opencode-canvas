@@ -1,0 +1,6 @@
+{
+  "gates": [
+    {"name": "typecheck", "cmd": "bun run typecheck", "timeout": 180},
+    {"name": "tests", "cmd": "bun test", "timeout": 600}
+  ]
+}

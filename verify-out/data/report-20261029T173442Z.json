@@ -1,0 +1,22 @@
+{
+  "gates": [
+    {
+      "name": "typecheck",
+      "cmd": "bun run typecheck",
+      "ok": true,
+      "exit": 0,
+      "elapsed": 1.0,
+      "tail": "\n$ tsc --noEmit"
+    },
+    {
+      "name": "tests",
+      "cmd": "bun test",
+      "ok": true,
+      "exit": 0,
+      "elapsed": 14.18,
+      "tail": "bun test v1.2.21 (7c45ed97)\n\n\n 138 pass\n 1 skip\n 0 fail\n 5103 expect() calls\nRan 139 tests across 19 files. [14.17s]"
+    }
+  ],
+  "passed": 2,
+  "total": 2
+}

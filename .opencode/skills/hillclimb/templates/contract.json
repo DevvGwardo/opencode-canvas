@@ -1,0 +1,14 @@
+{
+  "task": "One-sentence goal task (e.g. cut tile-grid p95 frame time on a fixed fixture set)",
+  "gate": "Gate that must stay green every attempt (e.g. bun test)",
+  "score": {
+    "command": "bash tools/hillclimb/score.sh",
+    "direction": "higher",
+    "epsilon": 1e-9,
+    "scorerHash": null,
+    "scorer": "score.sh"
+  },
+  "budget": 20,
+  "plateau": 3,
+  "created": null
+}
