@@ -1,5 +1,16 @@
 import { BROWSER_HEIGHT, BROWSER_WIDTH, browserUrl, type BrowserAction, type BrowserEvent } from "../shared/browser"
 
+const PIN_KEY = "occ.browser.pinned"
+
+/** Pinned (full panel) by default; unpinned shrinks to a corner preview. */
+function loadPinned(): boolean {
+  try {
+    return localStorage.getItem(PIN_KEY) !== "0"
+  } catch {
+    return true
+  }
+}
+
 const h = <K extends keyof HTMLElementTagNameMap>(tag: K, cls = "", text?: string) => {
   const element = document.createElement(tag)
   element.className = cls
@@ -16,6 +27,8 @@ export class BrowserPanel {
   private tabs: HTMLElement
   private dialog: HTMLElement
   private deviceBtn: HTMLButtonElement
+  private pinBtn: HTMLButtonElement
+  private pinned = loadPinned()
   private width = BROWSER_WIDTH
   private height = BROWSER_HEIGHT
   private stream?: EventSource
@@ -37,10 +50,12 @@ export class BrowserPanel {
     this.deviceBtn = this.button("Phone layout", "Switch browser between desktop and phone layouts", () =>
       this.send({ type: "viewport", mode: this.width === BROWSER_WIDTH ? "phone" : "desktop" }))
     const maximize = this.button("Expand", "Toggle full-size browser", () => {
+      if (!this.pinned) this.togglePin()
       this.el.classList.toggle("expanded")
       this.onChange()
     })
-    head.append(h("strong", "", "Browser"), h("span", "browser-note", "Isolated Chrome · shared on this host"), this.deviceBtn, maximize, close)
+    this.pinBtn = this.button("", "Pin the browser panel", () => this.togglePin())
+    head.append(h("strong", "", "Browser"), h("span", "browser-note", "Isolated Chrome · shared on this host"), this.pinBtn, this.deviceBtn, maximize, close)
     const toolbar = h("form", "browser-toolbar")
     this.address = h("input") as HTMLInputElement
     this.address.type = "text"
@@ -84,6 +99,9 @@ export class BrowserPanel {
     footer.append(this.status, typing, this.button("Enter", "Press Enter in browser", () => this.send({ type: "key", key: "Enter", code: "Enter", modifiers: 0 })))
     this.el.append(head, toolbar, this.tabs, this.viewport, this.dialog, footer)
     host.append(this.el)
+    this.el.classList.toggle("unpinned", !this.pinned)
+    document.documentElement.classList.toggle("browser-unpinned", !this.pinned)
+    this.paintPin()
     this.bindInput()
     this.el.addEventListener("keydown", (e) => {
       e.stopPropagation()
@@ -105,6 +123,30 @@ export class BrowserPanel {
     button.setAttribute("aria-label", title)
     button.addEventListener("click", () => run())
     return button
+  }
+
+  private paintPin() {
+    this.pinBtn.textContent = this.pinned ? "Unpin" : "Pin"
+    this.pinBtn.title = this.pinned
+      ? "Unpin: shrink the browser to a small corner preview"
+      : "Pin: restore the full-size browser panel"
+    this.pinBtn.setAttribute("aria-label", this.pinBtn.title)
+    this.pinBtn.setAttribute("aria-pressed", String(this.pinned))
+    this.pinBtn.classList.toggle("on", this.pinned)
+  }
+
+  private togglePin() {
+    this.pinned = !this.pinned
+    if (!this.pinned) this.el.classList.remove("expanded")
+    this.el.classList.toggle("unpinned", !this.pinned)
+    document.documentElement.classList.toggle("browser-unpinned", !this.pinned)
+    try {
+      localStorage.setItem(PIN_KEY, this.pinned ? "1" : "0")
+    } catch {
+      /* private mode */
+    }
+    this.paintPin()
+    this.onChange()
   }
 
   open(url?: string) {

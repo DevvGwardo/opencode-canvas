@@ -1,11 +1,19 @@
 import { describe, expect, test } from "bun:test"
-import { createAccess, hostName, isLoopback } from "../src/server/access"
+import { hostname } from "node:os"
+import { classifyAddresses, createAccess, hostName, isLoopback } from "../src/server/access"
 import { upstreamUrl } from "../src/server/upstream"
 
 const accessPassword = crypto.randomUUID()
 
+const entry = (address: string, internal = false) => ({ address, family: "IPv4", internal })
+
 const request = (path = "/canvas/config", headers?: HeadersInit, method = "GET", body?: string) =>
   new Request(`http://127.0.0.1:4317${path}`, { headers: { host: "127.0.0.1:4317", ...Object.fromEntries(new Headers(headers)) }, method, body })
+
+// Bun derives req.url from the Host header, so a request to another name must
+// carry that name in the URL too or the origin check sees a mismatch.
+const requestTo = (host: string, path = "/", headers?: HeadersInit, method = "GET", body?: string) =>
+  new Request(`http://${host}${path}`, { headers: { host, ...Object.fromEntries(new Headers(headers)) }, method, body })
 
 describe("Canvas access", () => {
   test("normalizes IPv6 and rejects malformed host headers", () => {
@@ -74,6 +82,34 @@ describe("Canvas access", () => {
     expect(access.guard(request("/", { ...headers, origin: "https://evil.example" }), false)?.status).toBe(403)
     expect(access.guard(request("/", { ...headers, host: "other.lan" }), false)?.status).toBe(403)
     expect(() => createAccess({ hostname: "127.0.0.1", accessPassword, publicOrigin: "https://canvas.lan/path" })).toThrow("Public origin")
+  })
+
+  test("origin matching follows the URL standard, not raw string case", () => {
+    const access = createAccess({ hostname: "0.0.0.0", accessPassword, allowedHosts: ["my-mac.local"] })
+    expect(access.guard(requestTo("my-mac.local:4317", "/", { origin: "http://MY-MAC.local:4317" }), false)).toBeUndefined()
+    expect(access.guard(requestTo("my-mac.local:4317", "/", { origin: "http://evil.example" }), false)?.status).toBe(403)
+    expect(access.guard(requestTo("my-mac.local:4317", "/", { origin: "not a url" }), false)?.status).toBe(403)
+  })
+
+  test("the host's own name reaches Canvas without --allow-host", () => {
+    const access = createAccess({ hostname: "0.0.0.0", accessPassword })
+    const name = hostname().toLowerCase()
+    expect(access.guard(request("/", { host: `${name}:4317` }), false)).toBeUndefined()
+    expect(access.guard(request("/", { host: `${name}.local:4317` }), false)).toBeUndefined()
+    expect(access.guard(request("/", { host: "some-other-pc:4317" }), false)?.status).toBe(403)
+  })
+
+  test("separates real LAN addresses from virtual and VPN adapters", () => {
+    const listed = classifyAddresses({
+      "Wi-Fi": [entry("192.168.1.199")],
+      Tailscale: [entry("100.107.134.78")],
+      "vEthernet (WSL)": [entry("172.28.96.1")],
+      "Loopback Pseudo-Interface 1": [entry("127.0.0.1", true)],
+      Ethernet: [entry("169.254.161.68")],
+    })
+    expect(listed.map((a) => a.address)).toEqual(["192.168.1.199", "100.107.134.78", "172.28.96.1"])
+    expect(listed.map((a) => a.kind)).toEqual(["lan", "vpn", "virtual"])
+    expect(listed[0].adapter).toBe("Wi-Fi")
   })
 })
 

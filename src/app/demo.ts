@@ -331,7 +331,27 @@ export class DemoBackend implements Backend {
     await this.prompt(id, { ...input, text: `/${input.name}${input.text ? " " + input.text : ""}` })
   }
   async compact(id: string, delivery?: Delivery) {
-    await this.prompt(id, { text: "Compact the session context", delivery })
+    const s = this.sessions.get(id)
+    if (!s) throw new Error("Session not found")
+    const item: InboxItem = { id: uid("msg"), sessionID: id, type: "compaction", payload: {}, delivery: delivery ?? "steer", time: { created: Date.now() } }
+    const message: Extract<Message, { type: "compaction" }> = {
+      type: "compaction",
+      id: item.id,
+      time: { created: Date.now() },
+      status: "running",
+      reason: "manual",
+      summary: "",
+      recent: "",
+    }
+    this.msgs.get(id)!.push(message)
+    this.emit("session.inbox.enqueued", { sessionID: id, inboxID: item.id, item })
+    this.emit("session.inbox.delivered", { sessionID: id, inboxID: item.id })
+    this.emit("session.compaction.started", { sessionID: id, reason: "manual", recent: "" })
+    setTimeout(() => {
+      message.status = "completed"
+      message.summary = "Earlier turns summarized so the session keeps working with a smaller context."
+      this.emit("session.compaction.ended", { sessionID: id, reason: "manual", text: message.summary, recent: "" })
+    }, 900 + Math.random() * 900)
   }
   async listFolders(path: string) {
     if (path === "/Users/you" || path === "/Users/you/") return ["code", "Desktop", "Documents"]

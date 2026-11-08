@@ -1,7 +1,8 @@
 #!/usr/bin/env bun
+import { hostname as osHostname } from "node:os"
 import { parseArgs } from "node:util"
 import { startServer } from "../src/server/server"
-import { isLoopback, networkAddresses } from "../src/server/access"
+import { classifyAddresses, isLoopback, type AddressKind, type LocalAddress } from "../src/server/access"
 
 const { values } = parseArgs({
   args: Bun.argv.slice(2),
@@ -72,15 +73,38 @@ try {
   const up = upstream()
   console.log(`\x1b[1mopencode-canvas\x1b[0m  ${url}`)
   if (!isLoopback(hostname)) {
-    for (const address of networkAddresses().filter((address) => hostname === "::" || !address.includes(":"))) {
-      console.log(`  network   http://${address.includes(":") ? `[${address}]` : address}:${server.port}`)
+    const ipv6 = hostname === "::"
+    const addresses = classifyAddresses().filter((entry) => entry.address.includes(":") === ipv6)
+    const target = (entry: LocalAddress) => `http://${entry.address.includes(":") ? `[${entry.address}]` : entry.address}:${server.port}`
+    const labels: Record<AddressKind, string> = { lan: "network ", vpn: "vpn     ", virtual: "virtual " }
+    for (const kind of ["lan", "vpn", "virtual"] as const) {
+      addresses.filter((entry) => entry.kind === kind).forEach((entry, i) => {
+        console.log(`  ${i === 0 ? labels[kind] : "        "}${target(entry)}${kind === "lan" ? "" : `  (${entry.adapter})`}`)
+      })
     }
-    console.log("  access    Canvas password required. Use a trusted LAN or HTTPS/VPN, not the public internet.")
+    if (!addresses.some((entry) => entry.kind === "lan")) {
+      console.log("  \x1b[33mwarning\x1b[0m   no physical LAN address found — another PC may not reach this host")
+    }
+    console.log(`  name      http://${osHostname()}:${server.port}`)
+    console.log("  access    Canvas password required. Sign in from the other PC. Use a trusted LAN or HTTPS/VPN, not the public internet.")
   }
   if (values.demo) console.log("  mode      simulated sessions (demo)")
   else if (up) console.log(`  opencode  ${up.url}${up.password ? "  (authenticated)" : ""}`)
   else console.log(`  opencode  \x1b[31munavailable\x1b[0m  ${upstreamError() ?? ""}`)
-  if (values.open) Bun.spawn([process.platform === "darwin" ? "open" : "xdg-open", values.origin ?? url], { stdio: ["ignore", "ignore", "ignore"] })
+  if (values.open) {
+    const openTarget = values.origin ?? url
+    const [openCmd, openArgs] =
+      process.platform === "darwin"
+        ? ["open", [openTarget]]
+        : process.platform === "win32"
+          ? ["cmd", ["/c", "start", "", openTarget]]
+          : ["xdg-open", [openTarget]]
+    try {
+      Bun.spawn([openCmd, ...openArgs], { stdio: ["ignore", "ignore", "ignore"] })
+    } catch (e) {
+      console.error(`opencode-canvas: could not open a browser (${(e as Error).message}) — open ${openTarget} manually`)
+    }
+  }
   let shuttingDown = false
   const shutdown = async () => {
     if (shuttingDown) return

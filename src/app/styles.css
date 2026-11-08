@@ -2701,6 +2701,18 @@ button {
   box-shadow: 0 0 0 3px rgba(229, 176, 74, 0.2);
 }
 
+.aa-toggle.dismiss.on {
+  color: #9ec5ff;
+  background: rgba(96, 145, 229, 0.13);
+  border-color: rgba(96, 145, 229, 0.55);
+}
+
+.aa-toggle.dismiss.on .aa-dot {
+  border-color: #6f9fe8;
+  background: #6f9fe8;
+  box-shadow: 0 0 0 3px rgba(96, 145, 229, 0.2);
+}
+
 .chip-action.allow {
   color: #f1cf88;
   font-weight: 600;
@@ -2999,6 +3011,37 @@ button {
   width: auto;
 }
 
+/* Unpinned: a small preview tucked in the bottom-right corner. */
+.browser-panel.unpinned {
+  top: auto;
+  left: auto;
+  right: 16px;
+  bottom: 16px;
+  width: clamp(220px, 24vw, 360px);
+  height: clamp(180px, 30vh, 320px);
+}
+
+.browser-panel.unpinned .browser-note,
+.browser-panel.unpinned .browser-tabs,
+.browser-panel.unpinned .browser-status {
+  display: none;
+}
+
+.browser-panel.unpinned .browser-head {
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 6px 8px;
+}
+
+.browser-panel.unpinned .browser-head strong {
+  display: none;
+}
+
+.browser-panel.unpinned .browser-toolbar,
+.browser-panel.unpinned .browser-footer {
+  padding: 6px;
+}
+
 .browser-head,
 .browser-toolbar,
 .browser-footer,
@@ -3037,6 +3080,11 @@ button {
 .browser-btn:hover {
   color: var(--text);
   background: #2b2b2b;
+}
+
+.browser-btn.on {
+  color: var(--text);
+  background: #303030;
 }
 
 .browser-toolbar input,
@@ -3151,6 +3199,10 @@ button {
   .browser-open .tiles-view {
     right: calc(min(58vw, 900px) + 24px);
   }
+  /* An unpinned browser is a corner preview, so it doesn't reserve the side. */
+  .browser-open.browser-unpinned .tiles-view {
+    right: 0;
+  }
 }
 
 @media (max-width: 999px) {
@@ -3225,4 +3277,87 @@ button {
     padding: 0 7px;
     font-size: 11px;
   }
+}
+
+/* ---- session loops -------------------------------------------------------- */
+
+.head-btn.loop.on {
+  color: #a6e8bd;
+  background: rgba(70, 211, 126, 0.13);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.tile-btn.loop.on {
+  color: #a6e8bd;
+  background: rgba(70, 211, 126, 0.13);
+}
+
+.tile.looping {
+  border-color: rgba(70, 211, 126, 0.35);
+}
+
+.popover.loop-editor {
+  width: 320px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.loop-title {
+  font-weight: 600;
+  font-size: 13.5px;
+}
+
+.loop-prompt {
+  min-height: 64px;
+  resize: vertical;
+  background: #101010;
+  border: 1px solid #2c2c2c;
+  border-radius: 6px;
+  color: var(--text);
+  font: 13px var(--font);
+  padding: 8px 10px;
+  outline: none;
+}
+
+.loop-prompt:focus {
+  border-color: #444;
+}
+
+.loop-grid {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 8px 10px;
+  align-items: center;
+  font-size: 12.5px;
+  color: var(--text-3);
+}
+
+.loop-grid input {
+  background: #101010;
+  border: 1px solid #2c2c2c;
+  border-radius: 6px;
+  color: var(--text);
+  font: 13px var(--font);
+  padding: 6px 9px;
+  outline: none;
+  width: 100%;
+}
+
+.loop-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  color: var(--text-3);
+  cursor: pointer;
+}
+
+.loop-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
 }

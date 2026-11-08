@@ -3,7 +3,7 @@
 // question prompts). Used by the open-session panel and by every tile.
 
 import { attachmentSrc, type Backend } from "./backend"
-import { describeTool, summarizeTools, toolOutput, toolRow, truncate } from "./format"
+import { compactionLabel, describeTool, summarizeTools, toolOutput, toolRow, truncate } from "./format"
 import { renderMarkdown } from "./markdown"
 import { spinner } from "./spinners"
 import type { Store } from "./store"
@@ -261,7 +261,9 @@ export class Transcript {
       case "session.execution.started":
       case "session.shell.started":
       case "session.shell.ended":
+      case "session.compaction.started":
       case "session.compaction.ended":
+      case "session.compaction.failed":
       case "session.model.selected":
       case "session.agent.selected":
       case "session.synthetic":
@@ -335,10 +337,15 @@ export class Transcript {
           flush()
           out.push({ kind: "shell", key: m.id, command: m.command, output: m.output?.output ?? "", status: m.status })
           break
-        case "compaction":
+        case "compaction": {
           flush()
-          out.push({ kind: "divider", key: m.id, text: "Context compacted" })
+          out.push({ kind: "divider", key: m.id, text: compactionLabel(m) })
+          const error = m.error as { message?: string; type?: string } | undefined
+          if (m.status === "failed" && error) {
+            out.push({ kind: "error", key: `${m.id}:error`, text: error.message ?? error.type ?? "Compaction failed" })
+          }
           break
+        }
         case "model-switched": {
           const model = (m as any).model
           if (model?.id) out.push({ kind: "divider", key: m.id, text: `Switched to ${model.id}` })
@@ -523,7 +530,8 @@ export class Transcript {
     const row = h("div", `msg inbox ${item.delivery}`)
     row.append(h("div", "gutter", item.delivery === "queue" ? "Queued" : "Steering"))
     const body = h("div", "body")
-    body.append(h("div", "user-text", item.payload?.text ?? `(${item.type})`))
+    const text = item.payload?.text ?? (item.type === "compaction" ? "Context compaction" : `(${item.type})`)
+    body.append(h("div", "user-text", text))
     const actions = h("div", "inbox-actions")
     if (item.delivery === "queue") {
       const steer = h("button", "link", "Send now") as HTMLButtonElement
@@ -619,17 +627,43 @@ export class Transcript {
           l.append(cb, document.createTextNode(" " + o.label))
           field.append(l)
         }
-        getters.push([f, () => boxes.filter((b) => b.checked).map((b) => b.value)])
-      } else if (f.type === "string" && f.options?.length && !f.custom) {
+        // `custom` lets the answer add free-text values beyond the listed options.
+        let other: HTMLInputElement | undefined
+        if (f.custom) {
+          other = h("input") as HTMLInputElement
+          other.type = "text"
+          other.placeholder = "Other…"
+          field.append(other)
+        }
+        getters.push([f, () => {
+          const values = boxes.filter((b) => b.checked).map((b) => b.value)
+          for (const part of (other?.value ?? "").split(",")) {
+            const value = part.trim()
+            if (value) values.push(value)
+          }
+          return values
+        }])
+      } else if (f.type === "string" && f.options?.length) {
         const sel = h("select") as HTMLSelectElement
         for (const o of f.options) {
           const opt = h("option", "", o.label) as HTMLOptionElement
           opt.value = o.value
           sel.append(opt)
         }
-        if (f.default) sel.value = f.default
         field.append(sel)
-        getters.push([f, () => sel.value])
+        if (!f.custom) {
+          if (f.default) sel.value = f.default
+          getters.push([f, () => sel.value])
+        } else {
+          // Options plus a free-text "Other" answer.
+          const other = h("input") as HTMLInputElement
+          other.type = "text"
+          other.placeholder = "Other…"
+          if (f.default && !f.options.some((o) => o.value === f.default)) other.value = String(f.default)
+          else if (f.default) sel.value = f.default
+          field.append(other)
+          getters.push([f, () => (other.value.trim() ? other.value.trim() : sel.value)])
+        }
       } else if (f.type === "external") {
         field.append(h("span", "dim", "Answer this one in OpenCode."))
       } else {
@@ -649,7 +683,7 @@ export class Transcript {
     submit.type = "submit"
     const cancel = h("button", "btn ghost", "Dismiss") as HTMLButtonElement
     cancel.type = "button"
-    cancel.addEventListener("click", () => this.act(() => this.backend.cancelForm(form.sessionID, form.id)))
+    cancel.addEventListener("click", () => this.act(() => this.store.dismissForm(form)))
     actions.append(submit, cancel)
     body.append(actions)
     body.addEventListener("submit", (e) => {

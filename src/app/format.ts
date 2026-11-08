@@ -4,7 +4,8 @@ import type { AssistantPart, ToolState } from "./types"
 
 export function basename(p?: string | null): string {
   if (!p) return ""
-  const parts = p.replace(/\/+$/, "").split("/")
+  // Windows paths use "\" separators, so split on either and drop trailing ones.
+  const parts = p.replace(/[\\/]+$/, "").split(/[\\/]/)
   return parts[parts.length - 1] || p
 }
 
@@ -227,6 +228,13 @@ export function lastAssistantText(parts: AssistantPart[]): string {
     if (p.type === "text" && p.text.trim()) return p.text
   }
   return ""
+}
+
+/** Transcript divider text for a compaction message, by lifecycle status. */
+export function compactionLabel(m: { status?: string; [k: string]: unknown }): string {
+  if (m.status === "running") return "Compacting context…"
+  if (m.status === "failed") return "Compaction failed"
+  return "Context compacted"
 }
 
 export function matchesQuery(q: string, ...fields: Array<string | undefined>): boolean {

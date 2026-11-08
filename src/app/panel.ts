@@ -5,6 +5,7 @@ import type { Backend } from "./backend"
 import type { CanvasView } from "./canvas"
 import { CANVAS_COMMANDS, parseCommand, runCanvasCommand, sendPrompt, SlashCommands } from "./commands"
 import { basename, shellQuote, timeAgo } from "./format"
+import { DEFAULT_LOOP_PROMPT, parseLoopArgs, type LoopManager } from "./loops"
 import { defaultModel, effortLabel, modelLabel, modelRef, models, setDefaultModel, sessionModelOption, setSessionEffort } from "./models"
 import { spinner } from "./spinners"
 import type { Store } from "./store"
@@ -31,6 +32,7 @@ export class SessionPanel {
   private autoBadge: HTMLElement
   private subBtn: HTMLButtonElement
   private stopBtn: HTMLButtonElement
+  private loopBtn: HTMLButtonElement
   private menuBtn: HTMLButtonElement
   private titleEl: HTMLElement
   private line: HTMLElement
@@ -48,6 +50,8 @@ export class SessionPanel {
   id?: string
   /** Set by the app once the tiled view exists. */
   tiles?: { isPinned(id: string): boolean; togglePin(id: string): void }
+  /** Set by the app: per-session auto-continue loops. */
+  loops?: LoopManager
   private attachments: Array<{ uri: string; name: string }> = []
   private closing = false
   private statusState = ""
@@ -94,6 +98,12 @@ export class SessionPanel {
     this.stopBtn = h("button", "head-btn stop", "Stop") as HTMLButtonElement
     this.stopBtn.title = "Interrupt (⌘.)"
     this.stopBtn.addEventListener("click", () => this.interrupt())
+    this.loopBtn = h("button", "head-btn loop", "Loop") as HTMLButtonElement
+    this.loopBtn.title = "Loop this session: re-prompt when idle (/loop)"
+    this.loopBtn.addEventListener("click", (e) => {
+      e.stopPropagation()
+      this.toggleLoopEditor()
+    })
     this.menuBtn = h("button", "head-btn menu", "⋯") as HTMLButtonElement
     this.menuBtn.setAttribute("aria-label", "Session menu")
     this.menuBtn.addEventListener("click", (e) => {
@@ -103,7 +113,7 @@ export class SessionPanel {
     const browserBtn = h("button", "head-btn", "Browser") as HTMLButtonElement
     browserBtn.title = "Open the integrated browser"
     browserBtn.addEventListener("click", () => this.openBrowser())
-    right.append(this.subBtn, this.stopBtn, browserBtn, this.menuBtn)
+    right.append(this.subBtn, this.stopBtn, this.loopBtn, browserBtn, this.menuBtn)
     this.header.append(left, right)
 
     this.titleEl = h("h1", "panel-title")
@@ -279,6 +289,13 @@ export class SessionPanel {
       ? "This session never asks for permission (⋯ menu to change)"
       : "Auto-approve is on for every session (top bar to change)"
     this.stopBtn.hidden = !working
+    const loop = this.id ? this.loops?.get(this.id) : undefined
+    const looping = loop?.status === "active"
+    this.loopBtn.classList.toggle("on", !!looping)
+    this.loopBtn.textContent = looping ? `Looping ${loop!.iterations}/${loop!.maxIterations}` : loop ? "Loop" : "Loop"
+    this.loopBtn.title = looping
+      ? `Looping: "${loop!.prompt.slice(0, 80)}" (${loop!.iterations}/${loop!.maxIterations}). Click to edit or stop.`
+      : "Loop this session: re-prompt when idle (/loop)"
     const n = this.store.subagentCount(id)
     this.subBtn.hidden = n === 0
     this.subBtn.textContent = `${n} subagent${n === 1 ? "" : "s"}`
@@ -296,6 +313,107 @@ export class SessionPanel {
   private async interrupt() {
     if (!this.id) return
     await this.transcript.act(() => this.backend.interrupt(this.id!))
+  }
+
+  /** Re-paint the header when a loop starts/stops elsewhere (tiles, /loop). */
+  refreshLoop() {
+    if (this.isOpen) this.renderHeader()
+  }
+
+  private startLoopFromArgs(id: string, args?: string) {
+    if (!this.loops) {
+      toast("Loops aren't available here")
+      return
+    }
+    try {
+      const opts = parseLoopArgs(args ?? "")
+      this.loops.restart(id, opts)
+      toast(opts.maxIterations === 1 ? "Loop armed: 1 iteration" : `Looping ${opts.maxIterations}×: "${opts.prompt.slice(0, 60)}"`)
+      this.renderHeader()
+    } catch (e) {
+      toast(`Couldn't start loop: ${(e as Error).message}`)
+    }
+  }
+
+  private stopLoop(id: string) {
+    this.loops?.stop(id)
+    toast("Loop stopped")
+    this.renderHeader()
+  }
+
+  private toggleLoopEditor() {
+    if (this.popover) return this.closePopover()
+    const id = this.id
+    if (!id || !this.loops) return
+    const existing = this.loops.get(id)
+    const pop = h("div", "popover loop-editor")
+    pop.addEventListener("pointerdown", (e) => e.stopPropagation())
+    const title = h("div", "loop-title", existing?.status === "active" ? `Looping ${existing.iterations}/${existing.maxIterations}` : "Loop this session")
+    const prompt = h("textarea", "loop-prompt") as HTMLTextAreaElement
+    prompt.rows = 3
+    prompt.placeholder = DEFAULT_LOOP_PROMPT
+    prompt.value = existing?.prompt ?? ""
+    const grid = h("div", "loop-grid")
+    const countLabel = h("label", "", "Iterations")
+    const count = h("input") as HTMLInputElement
+    count.type = "number"
+    count.min = "1"
+    count.max = "200"
+    count.value = String(existing?.maxIterations ?? 10)
+    const delayLabel = h("label", "", "Delay (s)")
+    const delay = h("input") as HTMLInputElement
+    delay.type = "number"
+    delay.min = "0"
+    delay.max = "600"
+    delay.step = "1"
+    delay.value = String(Math.round((existing?.delayMs ?? 3000) / 1000))
+    const stopLabel = h("label", "", "Stop phrase")
+    const stop = h("input") as HTMLInputElement
+    stop.type = "text"
+    stop.placeholder = "e.g. DONE (optional)"
+    stop.value = existing?.stopPhrase ?? ""
+    grid.append(countLabel, count, delayLabel, delay, stopLabel, stop)
+    const errLabel = h("label", "loop-check")
+    const errBox = h("input") as HTMLInputElement
+    errBox.type = "checkbox"
+    errBox.checked = existing?.stopOnError ?? true
+    errLabel.append(errBox, document.createTextNode(" Stop when a run fails"))
+    const hint = h("div", "pop-sub", "Re-prompts when the session goes idle. Pauses while it works or waits on you. Manual Stop ends the loop.")
+    const actions = h("div", "loop-actions")
+    const start = h("button", "btn primary", existing?.status === "active" ? "Restart loop" : "Start loop") as HTMLButtonElement
+    start.addEventListener("click", () => {
+      const maxIterations = Math.max(1, Math.min(200, Math.floor(Number(count.value) || 10)))
+      const delayMs = Math.max(0, Math.min(600_000, (Number(delay.value) || 0) * 1000))
+      this.startLoopFromArgs(id, [
+        prompt.value.trim() || DEFAULT_LOOP_PROMPT,
+        `--count ${maxIterations}`,
+        `--delay ${delayMs}`,
+        ...(stop.value.trim() ? [`--stop ${JSON.stringify(stop.value.trim())}`] : []),
+        ...(errBox.checked ? [] : ["--continue-on-error"]),
+      ].join(" "))
+      this.closePopover()
+    })
+    actions.append(start)
+    if (existing?.status === "active") {
+      const stopBtn = h("button", "btn", "Stop loop") as HTMLButtonElement
+      stopBtn.addEventListener("click", () => {
+        this.stopLoop(id)
+        this.closePopover()
+      })
+      actions.append(stopBtn)
+    }
+    if (existing && existing.status !== "active" && existing.reason) {
+      actions.append(h("span", "pop-sub", existing.reason))
+    }
+    pop.append(title, prompt, grid, errLabel, hint, actions)
+    const r = this.loopBtn.getBoundingClientRect()
+    const pr = this.el.getBoundingClientRect()
+    pop.style.top = `${r.bottom - pr.top + 6}px`
+    pop.style.right = `${pr.right - r.right}px`
+    this.closePopover()
+    this.el.append(pop)
+    this.popover = pop
+    prompt.focus()
   }
 
   private beginRename() {
@@ -661,6 +779,8 @@ export class SessionPanel {
           effort: (variant) => variant ? this.changeEffort(variant) : this.showEffortPicker(),
           compact: async () => { await this.backend.compact(id, delivery); this.transcript.scheduleRefetch(80) },
           stop: () => this.interrupt(),
+          loop: (args) => this.startLoopFromArgs(id, args),
+          stoploop: () => this.stopLoop(id),
           browser: (url) => this.openBrowser(url),
         })
         if (command.name !== "help" && this.id === id && this.input.value === draft) this.input.value = ""
