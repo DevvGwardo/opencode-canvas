@@ -37,7 +37,7 @@ export function browserUrl(value: string): string {
     throw new Error("Enter an HTTP(S) URL without embedded credentials.")
   }
   // Schemes such as file:, javascript: and chrome: must not become hostnames.
-  if (/^[a-z][\w+.-]*:/i.test(input) && !/^https?:\/\//i.test(input) && !/^[^/:]+:\d+(?:\/|$)/.test(input)) {
+  if (/^[a-z][\w+.-]*:/i.test(input) && !/^https?:\/\//i.test(input) && !/^[^/:]+:\d+(?:[/?#]|$)/.test(input)) {
     throw new Error("Only HTTP(S) pages are supported.")
   }
   return url.toString()

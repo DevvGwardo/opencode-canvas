@@ -67,6 +67,7 @@ export interface LocalAddress {
 /** Adapters a browser on another PC can never reach: VM switches and tunnels. */
 const VPN_ADAPTER = /tailscale|zerotier|hamachi|wireguard|openvpn|nordvpn|windscribe|radmin|vpn/i
 const VIRTUAL_ADAPTER = /vEthernet|hyper-?v|wsl|virtualbox|vmware|docker|virtual|loopback|bluetooth|pseudo|tap|npcap/i
+const LINK_LOCAL_V6 = /^fe[89ab][0-9a-f]:/i
 
 const ADDRESS_RANK: Record<AddressKind, number> = { lan: 0, vpn: 1, virtual: 2 }
 
@@ -82,12 +83,18 @@ export function classifyAddresses(
   const listed: LocalAddress[] = []
   for (const [adapter, entries] of Object.entries(interfaces)) {
     for (const entry of entries ?? []) {
-      if (entry.internal || entry.address.includes("%") || entry.address.startsWith("169.254.")) continue
+      if (entry.internal || entry.address.includes("%") || entry.address.startsWith("169.254.") || LINK_LOCAL_V6.test(entry.address)) continue
       const kind: AddressKind = VPN_ADAPTER.test(adapter) ? "vpn" : VIRTUAL_ADAPTER.test(adapter) ? "virtual" : "lan"
       listed.push({ address: entry.address, adapter, kind })
     }
   }
   return listed.sort((a, b) => ADDRESS_RANK[a.kind] - ADDRESS_RANK[b.kind])
+}
+
+export function isJsonContentType(req: Request) {
+  const header = req.headers.get("content-type")
+  if (!header) return false
+  return header.split(";")[0].trim().toLowerCase() === "application/json"
 }
 
 function digest(value: string) {
@@ -97,7 +104,14 @@ function digest(value: string) {
 export function createAccess(opts: AccessOptions) {
   const loopbackOnly = isLoopback(opts.hostname)
   const password = opts.accessPassword ?? process.env.CANVAS_PASSWORD
-  const publicOrigin = opts.publicOrigin ? new URL(opts.publicOrigin) : undefined
+  let publicOrigin: URL | undefined
+  if (opts.publicOrigin) {
+    try {
+      publicOrigin = new URL(opts.publicOrigin)
+    } catch {
+      throw new Error("Public origin must be an HTTP(S) origin without credentials, a path, a query, or a fragment.")
+    }
+  }
   if (publicOrigin && (!["http:", "https:"].includes(publicOrigin.protocol) || publicOrigin.username || publicOrigin.password || publicOrigin.pathname !== "/" || publicOrigin.search || publicOrigin.hash)) {
     throw new Error("Public origin must be an HTTP(S) origin without credentials, a path, a query, or a fragment.")
   }
@@ -113,7 +127,8 @@ export function createAccess(opts: AccessOptions) {
     // Another PC on the LAN usually reaches this host by name, not by IP, so
     // the machine's own name is allowed without --allow-host.
     const self = hostname()
-    for (const value of [opts.hostname, ...networkAddresses(), self, `${self}.local`, ...(opts.allowedHosts ?? [])]) {
+    const selfHosts = self.toLowerCase().endsWith(".local") ? [self] : [self, `${self}.local`]
+    for (const value of [opts.hostname, ...networkAddresses(), ...selfHosts, ...(opts.allowedHosts ?? [])]) {
       const name = hostName(value)
       if (!name) {
         if (value === self || value === `${self}.local`) continue
@@ -173,18 +188,27 @@ export function createAccess(opts: AccessOptions) {
     if (req.method !== "POST") return new Response("Method not allowed", { status: 405, headers: { allow: "GET, POST, DELETE" } })
     const failed = failures.get(ip)
     if (failed && failed.count >= 10) {
-      return Response.json({ message: "Too many attempts. Try again in a minute." }, { status: 429, headers: { ...headers, "retry-after": "60" } })
+      const retryAfter = Math.max(1, Math.ceil((failed.until - Date.now()) / 1000))
+      return Response.json(
+        { message: "Too many attempts. Try again in a minute." },
+        { status: 429, headers: { ...headers, "retry-after": String(retryAfter) } },
+      )
     }
-    if (!req.headers.get("content-type")?.startsWith("application/json")) {
+    if (!isJsonContentType(req)) {
       return Response.json({ message: "Expected JSON" }, { status: 415, headers })
+    }
+    const text = await req.text()
+    if (text.length > 8192) {
+      return Response.json({ message: "Request body is too large" }, { status: 413, headers })
     }
     let input: unknown
     try {
-      input = (await req.json())?.password
+      input = JSON.parse(text)?.password
     } catch {
       return Response.json({ message: "Invalid JSON" }, { status: 400, headers })
     }
     if (typeof input !== "string" || input.length > 1024 || !password || !timingSafeEqual(digest(input), digest(password))) {
+      if (!failed && failures.size >= 4096) failures.delete(failures.keys().next().value!)
       failures.set(ip, { count: (failed?.count ?? 0) + 1, until: Date.now() + 60_000 })
       return Response.json({ message: "Incorrect Canvas password" }, { status: 401, headers })
     }

@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test"
+import { tmpdir } from "node:os"
 import { BrowserHost, findBrowser } from "../src/server/browser"
 import { actionErrorMessage, browserUrl, validateBrowserAction, type BrowserEvent } from "../src/shared/browser"
 
@@ -6,6 +7,8 @@ describe("browser input", () => {
   test("normalizes web and local development URLs", () => {
     expect(browserUrl("example.com")).toBe("https://example.com/")
     expect(browserUrl("localhost:3000")).toBe("http://localhost:3000/")
+    expect(browserUrl("my-host:3000?a=1")).toBe("https://my-host:3000/?a=1")
+    expect(browserUrl("my-host:3000#top")).toBe("https://my-host:3000/#top")
     expect(browserUrl("http://192.168.1.2:5173/app")).toBe("http://192.168.1.2:5173/app")
     expect(browserUrl("about:blank")).toBe("about:blank")
     expect(() => browserUrl("file:///etc/passwd")).toThrow()
@@ -26,9 +29,13 @@ describe("browser input", () => {
     expect(() => validateBrowserAction({ type: "switch", id: "../version" })).toThrow()
   })
 
-  test("missing browser produces an actionable error", async () => {
+  test("missing browser produces an actionable error without leaving an idle timer", async () => {
+    expect(() => findBrowser(tmpdir())).toThrow("CANVAS_BROWSER_BIN")
     const host = new BrowserHost(undefined)
     await expect(host.start()).rejects.toThrow("Install Chrome or Chromium")
+    await expect(host.subscribe(() => {})).rejects.toThrow("Install Chrome or Chromium")
+    expect((host as any).idleTimer).toBeUndefined()
+    await expect(host.action({ type: "reload" })).rejects.toThrow("Open the browser panel first")
     await host.stop()
   })
 
@@ -99,6 +106,7 @@ test.skipIf(!executable)("real Chromium streams an isolated viewport, accepts in
     await until(() => events.filter((event) => event.type === "state").at(-1)?.url === url, "forward navigation")
     await host.action({ type: "viewport", mode: "phone" })
     await until(() => events.some((event) => event.type === "frame" && event.width === 390 && event.height === 780), "phone viewport")
+    await expect(host.action({ type: "click", x: 500, y: 100 })).rejects.toThrow("outside the current viewport")
     await host.action({ type: "close-tab", id: original.active })
     await until(() => events.filter((event) => event.type === "state").at(-1)?.tabs.length === 1, "active tab closing")
     const last = events.filter((event) => event.type === "state").at(-1)!
@@ -112,3 +120,12 @@ test.skipIf(!executable)("real Chromium streams an isolated viewport, accepts in
   }
   expect(host.running).toBe(false)
 }, 70_000)
+
+test.skipIf(!executable)("stopping during Chromium startup cancels cleanly without leaking", async () => {
+  const host = new BrowserHost(executable)
+  const starting = host.start()
+  await Bun.sleep(50)
+  await host.stop()
+  await expect(starting).rejects.toThrow("cancelled")
+  expect(host.running).toBe(false)
+}, 30_000)

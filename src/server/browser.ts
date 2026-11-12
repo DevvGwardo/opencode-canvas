@@ -1,7 +1,7 @@
 // A real, isolated Chromium browser. CDP stays on loopback; the client receives
 // only viewport frames and an allowlisted set of input/navigation actions.
 
-import { existsSync } from "node:fs"
+import { statSync } from "node:fs"
 import { mkdtemp, readFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -72,23 +72,39 @@ class CDP {
   }
 }
 
+function isFile(path: string): boolean {
+  try {
+    return statSync(path).isFile()
+  } catch {
+    return false
+  }
+}
+
 export function findBrowser(explicit?: string): string | undefined {
   const configured = explicit ?? process.env.CANVAS_BROWSER_BIN
-  if (configured) {
-    if (!existsSync(configured)) throw new Error("CANVAS_BROWSER_BIN must point to an installed Chrome/Chromium executable.")
+  if (configured !== undefined && configured !== "") {
+    if (!isFile(configured)) throw new Error("CANVAS_BROWSER_BIN must point to an installed Chrome/Chromium executable.")
     return configured
   }
+  const winRoots = process.platform === "win32" ? [
+    process.env.PROGRAMFILES ?? "C:\\Program Files",
+    process.env["PROGRAMFILES(X86)"] ?? "C:\\Program Files (x86)",
+    process.env.LOCALAPPDATA,
+  ].filter((dir): dir is string => Boolean(dir)) : []
   const candidates = process.platform === "darwin" ? [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
     "/Applications/Chromium.app/Contents/MacOS/Chromium",
     "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
   ] : process.platform === "win32" ? [
-    join(process.env.PROGRAMFILES ?? "C:\\Program Files", "Google/Chrome/Application/chrome.exe"),
-    join(process.env.LOCALAPPDATA ?? "", "Google/Chrome/Application/chrome.exe"),
+    ...winRoots.map((root) => join(root, "Google/Chrome/Application/chrome.exe")),
+    ...winRoots.map((root) => join(root, "BraveSoftware/Brave-Browser/Application/brave.exe")),
+    ...winRoots.map((root) => join(root, "Microsoft/Edge/Application/msedge.exe")),
   ] : [
     "/usr/bin/chromium", "/usr/bin/chromium-browser", "/usr/bin/google-chrome", "/opt/google/chrome/chrome",
+    "/usr/bin/brave-browser", "/usr/bin/microsoft-edge",
   ]
-  return candidates.find((path) => existsSync(path))
+  return candidates.find(isFile)
 }
 
 export class BrowserHost {
@@ -137,7 +153,7 @@ export class BrowserHost {
     const generation = this.generation
     const profile = await mkdtemp(join(tmpdir(), "opencode-canvas-browser-"))
     if (generation !== this.generation) {
-      await rm(profile, { recursive: true, force: true })
+      await rm(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }).catch(() => {})
       throw new Error("Browser startup cancelled")
     }
     this.profile = profile
@@ -166,8 +182,11 @@ export class BrowserHost {
     if (generation !== this.generation) throw new Error("Browser startup cancelled")
     const page = this.targets[0] ?? await this.newTarget()
     await this.attach(page)
+    const cdp = this.cdp
+    if (!cdp || generation !== this.generation) throw new Error("Browser startup cancelled")
     // Downloads never touch the host filesystem.
-    await this.cdp!.send("Browser.setDownloadBehavior", { behavior: "deny" })
+    await cdp.send("Browser.setDownloadBehavior", { behavior: "deny" })
+    if (generation !== this.generation) throw new Error("Browser startup cancelled")
   }
 
   private async listTargets(): Promise<Target[]> {
@@ -184,8 +203,10 @@ export class BrowserHost {
 
   private async attach(target: Target) {
     if (!target.webSocketDebuggerUrl?.startsWith("ws://127.0.0.1:")) throw new Error("Invalid private browser connection")
+    const generation = this.generation
     if (this.cdp) {
       if (this.streaming) await this.cdp.send("Page.stopScreencast").catch(() => {})
+      if (generation !== this.generation) throw new Error("Browser startup cancelled")
       const previous = this.cdp
       this.cdp = undefined
       previous.close()
@@ -195,7 +216,7 @@ export class BrowserHost {
     this.active = target.id
     let cdp: CDP | undefined
     cdp = await CDP.connect(target.webSocketDebuggerUrl, (method, params) => {
-      if (!cdp) return
+      if (!cdp || this.cdp !== cdp) return
       if (method === "Page.screencastFrame") {
         void cdp.send("Page.screencastFrameAck", { sessionId: params.sessionId }).catch(() => {})
         if (this.listeners.size && Date.now() - this.lastFrame >= 125) {
@@ -216,22 +237,30 @@ export class BrowserHost {
         this.queueCapture()
       }
     })
+    if (generation !== this.generation) {
+      cdp.close()
+      throw new Error("Browser startup cancelled")
+    }
     this.cdp = cdp
     await cdp.send("Page.enable")
     await cdp.send("Emulation.setDeviceMetricsOverride", {
       width: this.width, height: this.height, deviceScaleFactor: 1, mobile: false,
     })
     await cdp.send("Page.bringToFront")
+    if (generation !== this.generation) throw new Error("Browser startup cancelled")
     if (this.listeners.size) await this.startStream()
     await this.refresh()
   }
 
   private async refresh() {
+    const generation = this.generation
     if (!this.cdp) return
     this.targets = await this.listTargets()
+    if (!this.cdp || generation !== this.generation) return
     const target = this.targets.find((target) => target.id === this.active)
     if (!target) {
       const next = this.targets[0] ?? await this.newTarget()
+      if (!this.cdp || generation !== this.generation) return
       await this.attach(next)
       return
     }
@@ -244,7 +273,12 @@ export class BrowserHost {
 
   private queueRefresh() {
     clearTimeout(this.refreshTimer)
-    this.refreshTimer = setTimeout(() => void this.refresh().catch((e) => this.emit({ type: "error", message: e.message })), 150)
+    this.refreshTimer = setTimeout(() => {
+      if (!this.cdp) return
+      void this.refresh().catch((e) => {
+        if (this.cdp) this.emit({ type: "error", message: e.message })
+      })
+    }, 150)
   }
 
   private queueCapture() {
@@ -261,21 +295,30 @@ export class BrowserHost {
   private async startStream() {
     if (!this.cdp || this.streaming || !this.listeners.size) return
     this.streaming = true
-    await this.cdp.send("Page.startScreencast", {
-      format: "jpeg", quality: 65, maxWidth: BROWSER_WIDTH, maxHeight: BROWSER_HEIGHT, everyNthFrame: 2,
-    })
-    await this.capture()
+    try {
+      await this.cdp.send("Page.startScreencast", {
+        format: "jpeg", quality: 65, maxWidth: this.width, maxHeight: this.height, everyNthFrame: 2,
+      })
+      await this.capture()
+    } catch (e) {
+      this.streaming = false
+      throw e
+    }
   }
 
   async subscribe(listener: (event: BrowserEvent) => void) {
     clearTimeout(this.idleTimer)
+    this.idleTimer = undefined
     this.listeners.add(listener)
     const unsubscribe = () => {
       this.listeners.delete(listener)
       if (!this.listeners.size) {
         void this.cdp?.send("Page.stopScreencast").catch(() => {})
         this.streaming = false
-        this.idleTimer = setTimeout(() => void this.stop(), 5 * 60_000)
+        clearTimeout(this.idleTimer)
+        this.idleTimer = this.cdp || this.proc
+          ? setTimeout(() => void this.stop(), 5 * 60_000)
+          : undefined
       }
     }
     try {
@@ -306,7 +349,7 @@ export class BrowserHost {
     }
     switch (action.type) {
       case "viewport":
-        if (this.streaming) await cdp.send("Page.stopScreencast")
+        if (this.streaming) await cdp.send("Page.stopScreencast").catch(() => {})
         this.streaming = false
         this.width = action.mode === "phone" ? PHONE_WIDTH : BROWSER_WIDTH
         this.height = action.mode === "phone" ? PHONE_HEIGHT : BROWSER_HEIGHT
@@ -370,7 +413,13 @@ export class BrowserHost {
             previous?.close()
           }
           const res = await fetch(this.endpoint + `/json/close/${target.id}`, { signal: AbortSignal.timeout(5000) })
-          if (!res.ok) throw new Error("Couldn't close browser tab")
+          if (!res.ok) {
+            if (active && this.endpoint) {
+              const fallback = (await this.listTargets().catch(() => []))[0]
+              if (fallback) await this.attach(fallback).catch(() => {})
+            }
+            throw new Error("Couldn't close browser tab")
+          }
           if (active) {
             const next = (await this.listTargets()).find((page) => page.id !== target.id) ?? await this.newTarget()
             await this.attach(next)
@@ -393,6 +442,9 @@ export class BrowserHost {
     clearTimeout(this.idleTimer)
     clearTimeout(this.captureTimer)
     clearTimeout(this.refreshTimer)
+    this.idleTimer = undefined
+    this.captureTimer = undefined
+    this.refreshTimer = undefined
     const cdp = this.cdp
     this.cdp = undefined
     cdp?.close()
@@ -405,18 +457,18 @@ export class BrowserHost {
     const proc = this.proc
     this.proc = undefined
     if (proc && proc.exitCode === null) {
-      proc.kill()
+      try { proc.kill() } catch { /* Already exited. */ }
       await Promise.race([proc.exited, Bun.sleep(3000)])
       if (proc.exitCode === null) {
-        proc.kill("SIGKILL")
-        await proc.exited
+        try { proc.kill("SIGKILL") } catch { /* Already exited. */ }
+        await Promise.race([proc.exited, Bun.sleep(2000)])
       }
     }
     const profile = this.profile
     this.profile = undefined
     this.endpoint = undefined
     // This directory was created by this host, never a user's Chrome profile.
-    if (profile) await rm(profile, { recursive: true, force: true })
+    if (profile) await rm(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }).catch(() => {})
   }
 }
 

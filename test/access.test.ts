@@ -105,11 +105,54 @@ describe("Canvas access", () => {
       Tailscale: [entry("100.107.134.78")],
       "vEthernet (WSL)": [entry("172.28.96.1")],
       "Loopback Pseudo-Interface 1": [entry("127.0.0.1", true)],
-      Ethernet: [entry("169.254.161.68")],
+      Ethernet: [
+        entry("169.254.161.68"),
+        { address: "fe80::9c47:85a7:ac16:7bc0", family: "IPv6", internal: false },
+        { address: "fe80::1%eth0", family: "IPv6", internal: false },
+        { address: "2605:59c8:1890:8e10::1", family: "IPv6", internal: false },
+      ],
     })
-    expect(listed.map((a) => a.address)).toEqual(["192.168.1.199", "100.107.134.78", "172.28.96.1"])
-    expect(listed.map((a) => a.kind)).toEqual(["lan", "vpn", "virtual"])
+    expect(listed.map((a) => a.address)).toEqual(["192.168.1.199", "2605:59c8:1890:8e10::1", "100.107.134.78", "172.28.96.1"])
+    expect(listed.map((a) => a.kind)).toEqual(["lan", "lan", "vpn", "virtual"])
     expect(listed[0].adapter).toBe("Wi-Fi")
+  })
+
+  test("rejects malformed publicOrigin with a clear error", () => {
+    expect(() => createAccess({ hostname: "127.0.0.1", accessPassword, publicOrigin: "canvas.lan" })).toThrow("Public origin must be an HTTP(S) origin")
+    expect(() => createAccess({ hostname: "127.0.0.1", accessPassword, publicOrigin: "ftp://canvas.lan" })).toThrow("Public origin must be an HTTP(S) origin")
+  })
+
+  test("validates JSON media type, body bounds, Origin: null, and HTTP methods", async () => {
+    const access = createAccess({ hostname: "127.0.0.1", accessPassword })
+    expect(access.guard(request("/", { origin: "null" }), false)?.status).toBe(403)
+    expect(access.guard(request("/", { "sec-fetch-site": "same-site" }), false)?.status).toBe(403)
+
+    const ok = await access.auth(
+      request("/canvas/auth", { "content-type": "Application/JSON; charset=utf-8", origin: "http://127.0.0.1:4317" }, "POST", JSON.stringify({ password: accessPassword })),
+      "json-case",
+    )
+    expect(ok.status).toBe(200)
+
+    const wrongType = await access.auth(
+      request("/canvas/auth", { "content-type": "application/json-patch+json" }, "POST", JSON.stringify({ password: accessPassword })),
+      "json-patch",
+    )
+    expect(wrongType.status).toBe(415)
+
+    const tooBig = await access.auth(
+      request("/canvas/auth", { "content-type": "application/json" }, "POST", JSON.stringify({ password: "x".repeat(10_000) })),
+      "big-body",
+    )
+    expect(tooBig.status).toBe(413)
+
+    const badJson = await access.auth(
+      request("/canvas/auth", { "content-type": "application/json" }, "POST", "{"),
+      "bad-json",
+    )
+    expect(badJson.status).toBe(400)
+
+    const badMethod = await access.auth(request("/canvas/auth", undefined, "PUT"), "method")
+    expect(badMethod.status).toBe(405)
   })
 })
 
@@ -119,5 +162,6 @@ describe("upstream URL", () => {
     expect(() => upstreamUrl("http://name:password@localhost:4096")).toThrow("without embedded credentials")
     expect(() => upstreamUrl("file:///tmp/server")).toThrow("HTTP(S)")
     expect(() => upstreamUrl("http://localhost:4096/?token=secret")).toThrow("without embedded credentials")
+    expect(() => upstreamUrl("not a url")).toThrow("HTTP(S)")
   })
 })

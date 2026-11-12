@@ -1,11 +1,12 @@
 import { expect, test } from "bun:test"
+import { fileURLToPath } from "node:url"
 import { BrowserHost, findBrowser } from "../src/server/browser"
 
 const executable = findBrowser()
 
 test.skipIf(!executable)("question and transcript regressions in real Chromium", async () => {
   const bundle = await Bun.build({
-    entrypoints: [new URL("./ui-fixture.ts", import.meta.url).pathname],
+    entrypoints: [fileURLToPath(new URL("./ui-fixture.ts", import.meta.url))],
     target: "browser",
   })
   if (!bundle.success) throw new Error(bundle.logs.map(String).join("\n"))

@@ -3,7 +3,8 @@
 
 import index from "../app/index.html"
 import { homedir } from "node:os"
-import { createAccess, type AccessOptions } from "./access"
+import { posix } from "node:path"
+import { createAccess, isJsonContentType, type AccessOptions } from "./access"
 import { BrowserHost, findBrowser } from "./browser"
 import type { BrowserEvent } from "../shared/browser"
 import { authHeader, resolveUpstream, type Upstream, type UpstreamOptions } from "./upstream"
@@ -92,7 +93,7 @@ export async function startServer(opts: ServerOptions) {
           closed = true
           clearInterval(timer)
           void reader.cancel().catch(() => {})
-          controller.close()
+          try { controller.close() } catch { /* Already closed or errored. */ }
         }, 15_000)
       },
       async pull(controller) {
@@ -103,7 +104,7 @@ export async function startServer(opts: ServerOptions) {
             closed = true
             clearInterval(timer)
             void reader.cancel().catch(() => {})
-            controller.close()
+            try { controller.close() } catch { /* Already closed or errored. */ }
           } else controller.enqueue(value)
         } catch (e) {
           if (closed) return
@@ -128,7 +129,14 @@ export async function startServer(opts: ServerOptions) {
     let path: string
     try {
       // OpenCode accepts percent-encoded route names and trailing slashes.
-      path = decodeURIComponent(url.pathname).replace(/\/+$/, "")
+      const decoded = decodeURIComponent(url.pathname)
+      if (decoded.split("/").includes("..") || /[\\\x00-\x1f\x7f?#]/.test(decoded)) {
+        return Response.json({ message: "Invalid API path" }, { status: 400 })
+      }
+      path = posix.normalize(decoded).replace(/\/+$/, "")
+      if (path !== "/api" && !path.startsWith("/api/")) {
+        return Response.json({ message: "Invalid API path" }, { status: 400 })
+      }
     } catch {
       return Response.json({ message: "Invalid API path" }, { status: 400 })
     }
@@ -173,7 +181,13 @@ export async function startServer(opts: ServerOptions) {
         // Model settings and variant bodies can contain provider credentials.
         // Only expose the identity and effort IDs needed by the UI.
         if (res.ok && req.method !== "HEAD" && (path === "/api/model" || path === "/api/model/default")) {
-          const payload = await res.json() as { data: any }
+          let payload: unknown
+          try {
+            payload = await res.json()
+          } catch {
+            return Response.json({ message: "Invalid upstream model response" }, { status: 502, headers: out })
+          }
+          const raw = Array.isArray(payload) ? payload : payload && typeof payload === "object" ? (payload as any).data : undefined
           const safeModel = (m: any) => m && typeof m.id === "string" && typeof m.providerID === "string" ? {
             id: m.id,
             providerID: m.providerID,
@@ -187,8 +201,8 @@ export async function startServer(opts: ServerOptions) {
             }) : [],
           } : null
           return Response.json({
-            data: Array.isArray(payload.data) ? payload.data.map(safeModel).filter((m) => m !== null) : safeModel(payload.data),
-          }, { headers: out })
+            data: Array.isArray(raw) ? raw.map(safeModel).filter((m) => m !== null) : safeModel(raw),
+          }, { status: res.status, headers: out })
         }
         if (isStream) {
           out.set("cache-control", "no-cache, no-transform")
@@ -248,7 +262,9 @@ export async function startServer(opts: ServerOptions) {
           req.signal.addEventListener("abort", abort, { once: true })
           heartbeat = setInterval(() => {
             if (!access.authenticated(req)) {
-              send({ type: "error", message: "Canvas login expired. Sign in again." })
+              try {
+                controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "error", message: "Canvas login expired. Sign in again." })}\n\n`))
+              } catch { /* Already closed or errored. */ }
               abort()
             } else {
               try { controller.enqueue(encoder.encode(": heartbeat\n\n")) } catch { close() }
@@ -269,7 +285,7 @@ export async function startServer(opts: ServerOptions) {
       })
     }
     if (path === "/canvas/browser/action" && req.method === "POST") {
-      if (!req.headers.get("content-type")?.startsWith("application/json")) return Response.json({ message: "Expected JSON" }, { status: 415, headers })
+      if (!isJsonContentType(req)) return Response.json({ message: "Expected JSON" }, { status: 415, headers })
       try {
         const text = await req.text()
         if (text.length > 32_000) return Response.json({ message: "Browser action is too large" }, { status: 413, headers })
@@ -295,17 +311,26 @@ export async function startServer(opts: ServerOptions) {
       "/canvas/config": async (req) => {
         const blocked = access.guard(req)
         if (blocked) return blocked
-        const up = await getUpstream()
+        let up: Upstream | undefined
         let version: string | undefined
-        if (up) {
+        for (let attempt = 0; attempt < 2; attempt++) {
+          up = opts.demo ? undefined : await getUpstream(attempt > 0)
+          if (!up) break
+          const auth = authHeader(up)
           try {
             const res = await fetch(up.url + "/api/info", {
-              headers: { authorization: authHeader(up) ?? "" },
-              signal: AbortSignal.timeout(5_000),
+              ...(auth ? { headers: { authorization: auth } } : {}),
+              signal: AbortSignal.any([req.signal, AbortSignal.timeout(5_000)]),
             })
-            if (res.ok) version = (await res.json())?.version
-            else upstreamError = `OpenCode responded ${res.status} to /api/info`
+            if (res.ok) {
+              const info = await res.json() as { version?: unknown }
+              version = typeof info?.version === "string" ? info.version : undefined
+            } else {
+              upstreamError = `OpenCode responded ${res.status} to /api/info`
+            }
+            break
           } catch (e) {
+            if (req.signal.aborted) return new Response(null, { status: 499 })
             upstreamError = (e as Error).message
             upstream = undefined
           }

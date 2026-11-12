@@ -4,30 +4,31 @@ import { parseArgs } from "node:util"
 import { startServer } from "../src/server/server"
 import { classifyAddresses, isLoopback, type AddressKind, type LocalAddress } from "../src/server/access"
 
-const { values } = parseArgs({
-  args: Bun.argv.slice(2),
-  options: {
-    port: { type: "string", short: "p" },
-    hostname: { type: "string" },
-    lan: { type: "boolean" },
-    "allow-host": { type: "string", multiple: true },
-    origin: { type: "string" },
-    "browser-bin": { type: "string" },
-    "no-browser": { type: "boolean" },
-    server: { type: "string" },
-    password: { type: "string" },
-    username: { type: "string" },
-    demo: { type: "boolean" },
-    dev: { type: "boolean" },
-    open: { type: "boolean" },
-    "no-autostart": { type: "boolean" },
-    help: { type: "boolean", short: "h" },
-  },
-  strict: true,
-})
+try {
+  const { values } = parseArgs({
+    args: Bun.argv.slice(2),
+    options: {
+      port: { type: "string", short: "p" },
+      hostname: { type: "string" },
+      lan: { type: "boolean" },
+      "allow-host": { type: "string", multiple: true },
+      origin: { type: "string" },
+      "browser-bin": { type: "string" },
+      "no-browser": { type: "boolean" },
+      server: { type: "string" },
+      password: { type: "string" },
+      username: { type: "string" },
+      demo: { type: "boolean" },
+      dev: { type: "boolean" },
+      open: { type: "boolean" },
+      "no-autostart": { type: "boolean" },
+      help: { type: "boolean", short: "h" },
+    },
+    strict: true,
+  })
 
-if (values.help) {
-  console.log(`opencode-canvas: every OpenCode v2 session on one infinite canvas
+  if (values.help) {
+    console.log(`opencode-canvas: every OpenCode v2 session on one infinite canvas
 
 Usage: opencode-canvas [options]
 
@@ -46,13 +47,14 @@ Usage: opencode-canvas [options]
       --no-autostart    Don't start the OpenCode background service if it's stopped
       --dev             Hot reload the UI while editing
   -h, --help            Show this help`)
-  process.exit(0)
-}
+    process.exit(0)
+  }
 
-const hostname = values.hostname ?? (values.lan ? "0.0.0.0" : "127.0.0.1")
-
-try {
-  const port = Number(values.port ?? process.env.PORT ?? 4317)
+  const rawHostname = values.hostname ?? (values.lan ? "0.0.0.0" : "127.0.0.1")
+  const hostname = rawHostname.startsWith("[") && rawHostname.endsWith("]") ? rawHostname.slice(1, -1) : rawHostname
+  const portArg = values.port !== undefined ? values.port : (process.env.PORT || "4317")
+  const portText = portArg.trim()
+  const port = /^\d+$/.test(portText) ? Number(portText) : Number.NaN
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("Port must be an integer from 0 to 65535.")
   const { server, upstream, upstreamError, stop } = await startServer({
     port,
@@ -68,12 +70,12 @@ try {
     dev: !!values.dev,
     autostart: !values["no-autostart"],
   })
-  const localHost = hostname === "0.0.0.0" || hostname === "::" ? "127.0.0.1" : hostname
+  const localHost = hostname === "0.0.0.0" ? "127.0.0.1" : hostname === "::" ? "::1" : hostname
   const url = `http://${localHost.includes(":") ? `[${localHost}]` : localHost}:${server.port}`
   const up = upstream()
   console.log(`\x1b[1mopencode-canvas\x1b[0m  ${url}`)
   if (!isLoopback(hostname)) {
-    const ipv6 = hostname === "::"
+    const ipv6 = hostname.includes(":")
     const addresses = classifyAddresses().filter((entry) => entry.address.includes(":") === ipv6)
     const target = (entry: LocalAddress) => `http://${entry.address.includes(":") ? `[${entry.address}]` : entry.address}:${server.port}`
     const labels: Record<AddressKind, string> = { lan: "network ", vpn: "vpn     ", virtual: "virtual " }
@@ -100,7 +102,7 @@ try {
           ? ["cmd", ["/c", "start", "", openTarget]]
           : ["xdg-open", [openTarget]]
     try {
-      Bun.spawn([openCmd, ...openArgs], { stdio: ["ignore", "ignore", "ignore"] })
+      Bun.spawn([openCmd, ...openArgs], { stdio: ["ignore", "ignore", "ignore"] }).unref()
     } catch (e) {
       console.error(`opencode-canvas: could not open a browser (${(e as Error).message}) — open ${openTarget} manually`)
     }
@@ -118,7 +120,10 @@ try {
   const msg = (e as Error).message
   console.error(`opencode-canvas: ${msg}`)
   if (/in use|EADDRINUSE/i.test(msg)) {
-    console.error(`  Another copy is probably running: open it, stop it with \`pkill -f opencode-canvas\`, or pass --port <n>.`)
+    const stopHint = process.platform === "win32"
+      ? "stop the earlier process"
+      : "stop it with `pkill -f opencode-canvas`"
+    console.error(`  Another copy is probably running: open it, ${stopHint}, or pass --port <n>.`)
   }
   process.exit(1)
 }

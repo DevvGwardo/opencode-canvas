@@ -24,7 +24,7 @@ export interface UpstreamOptions {
 }
 
 function configDir() {
-  return process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config")
+  return process.env.XDG_CONFIG_HOME || join(homedir(), ".config")
 }
 
 async function readServicePassword(): Promise<string | undefined> {
@@ -38,19 +38,54 @@ async function readServicePassword(): Promise<string | undefined> {
   }
 }
 
-async function run(bin: string, args: string[], timeoutMs = 20_000) {
-  const proc = Bun.spawn([bin, ...args], { stdout: "pipe", stderr: "pipe", stdin: "ignore" })
-  const timer = setTimeout(() => proc.kill(), timeoutMs)
-  const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()])
-  await proc.exited
-  clearTimeout(timer)
-  return { code: proc.exitCode ?? 1, out: out.trim(), err: err.trim() }
+const ANSI_RE = /\x1b\[[0-9;]*m/g
+
+async function run(bin: string, args: string[], timeoutMs = 20_000, capture = true) {
+  let proc: Bun.Subprocess
+  try {
+    proc = Bun.spawn([bin, ...args], {
+      stdout: capture ? "pipe" : "ignore",
+      stderr: capture ? "pipe" : "ignore",
+      stdin: "ignore",
+    })
+  } catch (e) {
+    throw new Error(`OpenCode CLI (${bin}) could not be started (${(e as Error).message}). Start OpenCode manually or pass --server <url>.`)
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      try { proc.kill() } catch {}
+      reject(new Error(`\`${bin} ${args.join(" ")}\` timed out`))
+    }, timeoutMs)
+  })
+  try {
+    if (!capture) {
+      await Promise.race([proc.exited, timeout])
+      return { code: proc.exitCode ?? 1, out: "", err: "" }
+    }
+    const [out, err] = await Promise.race([
+      Promise.all([
+        new Response(proc.stdout as ReadableStream<Uint8Array>).text(),
+        new Response(proc.stderr as ReadableStream<Uint8Array>).text(),
+        proc.exited,
+      ]),
+      timeout,
+    ])
+    return { code: proc.exitCode ?? 1, out: out.trim(), err: err.trim() }
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 const URL_RE = /https?:\/\/[^\s]+/
 
 export function upstreamUrl(value: string) {
-  const url = new URL(value)
+  let url: URL
+  try {
+    url = new URL(value)
+  } catch {
+    throw new Error("OpenCode server must be an HTTP(S) URL without embedded credentials, a query, or a fragment.")
+  }
   if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
     throw new Error("OpenCode server must be an HTTP(S) URL without embedded credentials, a query, or a fragment.")
   }
@@ -59,13 +94,13 @@ export function upstreamUrl(value: string) {
 
 async function serviceUrl(bin: string, autostart: boolean): Promise<string | undefined> {
   let status = await run(bin, ["service", "status"])
-  let match = status.out.match(URL_RE)
+  let match = status.out.replace(ANSI_RE, "").match(URL_RE)
   if (match) return match[0]
   if (!autostart) return undefined
-  await run(bin, ["service", "start"], 60_000)
+  await run(bin, ["service", "start"], 60_000, false)
   for (let i = 0; i < 20; i++) {
     status = await run(bin, ["service", "status"])
-    match = status.out.match(URL_RE)
+    match = status.out.replace(ANSI_RE, "").match(URL_RE)
     if (match) return match[0]
     await Bun.sleep(500)
   }
