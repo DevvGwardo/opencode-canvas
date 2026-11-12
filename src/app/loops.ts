@@ -78,42 +78,92 @@ export function normalizeLoopOptions(opts: LoopOptions): Required<Pick<LoopOptio
   return { prompt, maxIterations, delayMs, stopPhrase, stopOnError: opts.stopOnError ?? true }
 }
 
-/** Split `/loop` remainder into options. Flags (case-insensitive values kept):\n *  --count N | -n N, --delay Ms | --delay-secs S, --stop TEXT | --until TEXT,\n *  --continue-on-error. Everything else is the prompt. */
+function splitLoopTokens(raw: string): string[] {
+  const out: string[] = []
+  let cur = ""
+  let quote: '"' | "'" | undefined
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i]
+    if (quote) {
+      if (quote === '"' && ch === "\\" && i + 1 < raw.length && (raw[i + 1] === '"' || raw[i + 1] === "\\")) {
+        cur += raw[++i]
+      } else if (ch === quote) {
+        quote = undefined
+        cur += ch
+      } else {
+        cur += ch
+      }
+      continue
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch
+      cur += ch
+    } else if (/\s/.test(ch)) {
+      if (cur) {
+        out.push(cur)
+        cur = ""
+      }
+    } else {
+      cur += ch
+    }
+  }
+  if (cur) out.push(cur)
+  return out
+}
+
+const unquote = (s: string) => {
+  if (s.length >= 2 && ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'")))) return s.slice(1, -1)
+  return s
+}
+
+/** Split `/loop` remainder into options. Flags (case-insensitive values kept):
+ *  --count N | -n N, --delay Ms | --delay-secs S, --stop TEXT | --until TEXT,
+ *  --continue-on-error. Everything else is the prompt. */
 export function parseLoopArgs(raw: string): LoopOptions {
-  const tokens = raw.match(/(?:"[^"]*"|'[^']*'|\S+)/g) ?? []
+  const tokens = splitLoopTokens(raw)
   const promptParts: string[] = []
   let maxIterations: number | undefined
   let delayMs: number | undefined
   let stopPhrase: string | undefined
   let stopOnError = true
 
-  const unquote = (s: string) => {
-    if (s.length >= 2 && ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'")))) return s.slice(1, -1)
-    return s
-  }
   for (let i = 0; i < tokens.length; i++) {
-    const t = tokens[i].toLowerCase()
-    const next = () => unquote(tokens[++i] ?? "")
-    if (t === "--count" || t === "-n" || t === "--iterations") {
-      const n = Math.floor(Number(next()))
-      if (Number.isFinite(n)) maxIterations = n
-    } else if (t === "--delay") {
-      const n = Number(next())
-      if (Number.isFinite(n)) delayMs = n
-    } else if (t === "--delay-secs" || t === "--delay-seconds" || t === "--delay-s") {
-      const n = Number(next())
-      if (Number.isFinite(n)) delayMs = n * 1000
-    } else if (t === "--stop" || t === "--until" || t === "--stop-phrase") {
-      // --stop "some phrase" takes one token; `--stop=` form handled below.
-      stopPhrase = next() || undefined
-    } else if (t.startsWith("--stop=") || t.startsWith("--until=")) {
-      stopPhrase = unquote(tokens[i].slice(tokens[i].indexOf("=") + 1)) || undefined
-    } else if (t === "--continue-on-error" || t === "--no-stop-on-error") {
+    const rawTok = tokens[i]
+    const eq = rawTok.indexOf("=")
+    const flag = (eq >= 0 ? rawTok.slice(0, eq) : rawTok).toLowerCase()
+    const takeVal = (): string | undefined => {
+      if (eq >= 0) return unquote(rawTok.slice(eq + 1))
+      if (i + 1 < tokens.length) return unquote(tokens[++i])
+      return undefined
+    }
+
+    if (flag === "--count" || flag === "-n" || flag === "--iterations") {
+      const v = takeVal()?.trim() ?? ""
+      if (v) {
+        const n = Math.floor(Number(v))
+        if (Number.isFinite(n)) maxIterations = n
+      }
+    } else if (flag === "--delay") {
+      const v = takeVal()?.trim() ?? ""
+      if (v) {
+        const n = Number(v)
+        if (Number.isFinite(n)) delayMs = n
+      }
+    } else if (flag === "--delay-secs" || flag === "--delay-seconds" || flag === "--delay-s") {
+      const v = takeVal()?.trim() ?? ""
+      if (v) {
+        const n = Number(v)
+        if (Number.isFinite(n)) delayMs = n * 1000
+      }
+    } else if (flag === "--stop" || flag === "--until" || flag === "--stop-phrase") {
+      const v = takeVal()
+      if (v !== undefined) stopPhrase = v.trim() || undefined
+    } else if (flag === "--continue-on-error" || flag === "--no-stop-on-error") {
       stopOnError = false
-    } else if (t === "--stop-on-error") {
+    } else if (flag === "--stop-on-error") {
       stopOnError = true
     } else {
-      promptParts.push(tokens[i])
+      promptParts.push(rawTok)
     }
   }
   return {
@@ -142,16 +192,24 @@ export function matchesStopPhrase(desc: Message[], phrase: string | undefined): 
   return latestAssistantText(desc).toLowerCase().includes(p)
 }
 
-type MinimalStore = Pick<Store, "running" | "needsInput"> & { on(l: { event?: (ev: OcEvent) => void }): () => void }
+type MinimalStore = Pick<Store, "running" | "needsInput"> & {
+  loaded?: boolean
+  sessions?: Map<string, unknown>
+  on(l: { event?: (ev: OcEvent) => void; structure?: () => void }): () => void
+}
 type MinimalBackend = Pick<Backend, "prompt" | "messages">
 
 export class LoopManager {
   private loops = new Map<string, LoopInfo>()
   private timers = new Map<string, unknown>()
+  private inflight = new Map<string, LoopInfo>()
   private listeners = new Set<() => void>()
   private storeIO: LoopStoreShape | undefined
   private timersIO: LoopTimers
   private detach?: () => void
+  private restoreTimer?: unknown
+  private pendingRestoreKick = false
+  private destroyed = false
 
   constructor(
     private store: MinimalStore,
@@ -161,11 +219,20 @@ export class LoopManager {
     this.storeIO = io?.storage !== undefined ? (io.storage ?? undefined) : defaultStore()
     this.timersIO = io?.timers ?? defaultTimers
     this.restore()
-    this.detach = this.store.on({ event: (ev) => void this.handleEvent(ev) })
+    this.detach = this.store.on({
+      event: (ev) => void this.handleEvent(ev),
+      structure: () => this.onStructure(),
+    })
   }
 
   destroy() {
+    this.destroyed = true
     this.detach?.()
+    if (this.restoreTimer !== undefined) {
+      this.timersIO.clearTimeout(this.restoreTimer)
+      this.restoreTimer = undefined
+    }
+    this.pendingRestoreKick = false
     for (const t of this.timers.values()) this.timersIO.clearTimeout(t)
     this.timers.clear()
   }
@@ -183,11 +250,12 @@ export class LoopManager {
   }
 
   list(): LoopInfo[] {
-    return [...this.loops.values()].sort((a, b) => a.updatedAt - b.updatedAt)
+    return [...this.loops.values()].map((l) => ({ ...l })).sort((a, b) => a.updatedAt - b.updatedAt)
   }
 
   get(sessionID: string): LoopInfo | undefined {
-    return this.loops.get(sessionID)
+    const l = this.loops.get(sessionID)
+    return l ? { ...l } : undefined
   }
 
   isLooping(sessionID: string): boolean {
@@ -202,6 +270,7 @@ export class LoopManager {
 
   start(sessionID: string, opts: LoopOptions): LoopInfo {
     const norm = normalizeLoopOptions(opts)
+    this.clearTimer(sessionID)
     const prev = this.loops.get(sessionID)
     const info: LoopInfo = {
       sessionID,
@@ -215,6 +284,7 @@ export class LoopManager {
       reason: undefined,
       updatedAt: Date.now(),
     }
+    if (this.destroyed) return { ...info }
     this.loops.set(sessionID, info)
     this.emit()
     // If the session is already idle, kick off the next iteration without
@@ -225,6 +295,7 @@ export class LoopManager {
 
   /** Restart the iteration counter as well (fresh loop). */
   restart(sessionID: string, opts: LoopOptions): LoopInfo {
+    this.clearTimer(sessionID)
     this.loops.delete(sessionID)
     return this.start(sessionID, opts)
   }
@@ -233,6 +304,7 @@ export class LoopManager {
     const cur = this.loops.get(sessionID)
     this.clearTimer(sessionID)
     if (!cur) return undefined
+    if (cur.status !== "active") return { ...cur }
     const next: LoopInfo = { ...cur, status: "stopped", reason, updatedAt: Date.now() }
     this.loops.set(sessionID, next)
     this.emit()
@@ -265,6 +337,7 @@ export class LoopManager {
   }
 
   private finish(sessionID: string, status: LoopStatus, reason: string) {
+    if (this.destroyed) return
     const cur = this.loops.get(sessionID)
     this.clearTimer(sessionID)
     if (!cur || cur.status !== "active") return
@@ -272,7 +345,49 @@ export class LoopManager {
     this.emit()
   }
 
+  private onStructure() {
+    if (this.destroyed || !this.pendingRestoreKick) return
+    if (this.store.loaded === false) return
+    this.pendingRestoreKick = false
+    this.kickRestored()
+  }
+
+  private kickRestored() {
+    if (this.destroyed) return
+    for (const id of [...this.loops.keys()]) {
+      const loop = this.loops.get(id)
+      if (!loop || loop.status !== "active") continue
+      if (this.store.loaded === true && this.store.sessions && !this.store.sessions.has(id)) continue
+      if (loop.iterations > 0 && loop.stopPhrase) void this.checkStopAndKick(id, loop)
+      else void this.maybeKick(id)
+    }
+  }
+
+  private async checkStopAndKick(id: string, loop: LoopInfo): Promise<void> {
+    if (this.destroyed || this.loops.get(id) !== loop || loop.status !== "active") return
+    if (this.inflight.has(id) || this.store.running.has(id) || this.store.needsInput(id)) return
+    if (loop.iterations >= loop.maxIterations) {
+      this.finish(id, "finished", `Done after ${loop.iterations} iteration${loop.iterations === 1 ? "" : "s"}`)
+      return
+    }
+    if (loop.stopPhrase) {
+      try {
+        const page = await this.backend.messages(id, 10)
+        if (this.destroyed || this.loops.get(id) !== loop || loop.status !== "active") return
+        if (this.inflight.has(id) || this.store.running.has(id) || this.store.needsInput(id)) return
+        if (matchesStopPhrase(page.data, loop.stopPhrase)) {
+          this.finish(id, "finished", `Stop phrase "${loop.stopPhrase}" found`)
+          return
+        }
+      } catch {
+        if (this.destroyed || this.loops.get(id) !== loop || loop.status !== "active") return
+      }
+    }
+    void this.maybeKick(id)
+  }
+
   private async handleEvent(ev: OcEvent) {
+    if (this.destroyed) return
     const id: string | undefined = ev.data?.sessionID
     if (!id) return
     if (ev.type === "session.deleted") {
@@ -290,6 +405,7 @@ export class LoopManager {
   }
 
   private async onSettled(id: string, outcome: "succeeded" | "failed" | "interrupted"): Promise<void> {
+    if (this.destroyed) return
     const loop = this.loops.get(id)
     if (!loop || loop.status !== "active") return
     // Never talk over the agent: waiting turns, permission prompts and
@@ -313,12 +429,14 @@ export class LoopManager {
     if (loop.stopPhrase) {
       try {
         const page = await this.backend.messages(id, 10)
-        if (this.loops.get(id)?.status !== "active") return
+        if (this.destroyed || this.loops.get(id) !== loop || loop.status !== "active") return
+        if (this.store.running.has(id) || this.store.needsInput(id)) return
         if (matchesStopPhrase(page.data, loop.stopPhrase)) {
           this.finish(id, "finished", `Stop phrase "${loop.stopPhrase}" found`)
           return
         }
       } catch {
+        if (this.destroyed || this.loops.get(id) !== loop || loop.status !== "active") return
         // A failed history read shouldn't kill the loop; try the prompt anyway.
       }
     }
@@ -326,8 +444,10 @@ export class LoopManager {
   }
 
   private async maybeKick(id: string): Promise<void> {
+    if (this.destroyed) return
     const loop = this.loops.get(id)
     if (!loop || loop.status !== "active") return
+    if (this.inflight.has(id)) return
     if (this.store.running.has(id)) return
     if (this.store.needsInput(id)) return
     if (loop.iterations >= loop.maxIterations) {
@@ -338,8 +458,10 @@ export class LoopManager {
   }
 
   private schedule(id: string) {
+    if (this.destroyed) return
     const loop = this.loops.get(id)
     if (!loop || loop.status !== "active") return
+    if (this.inflight.has(id)) return
     this.clearTimer(id)
     const delay = Math.max(0, loop.delayMs)
     if (delay === 0) {
@@ -351,8 +473,10 @@ export class LoopManager {
 
   private async fire(id: string): Promise<void> {
     this.timers.delete(id)
+    if (this.destroyed) return
     const loop = this.loops.get(id)
     if (!loop || loop.status !== "active") return
+    if (this.inflight.has(id)) return
     // Re-check right before sending: the session may have started again, or
     // be waiting on you. In both cases the next settled event resumes us.
     if (this.store.running.has(id)) return
@@ -361,20 +485,31 @@ export class LoopManager {
       this.finish(id, "finished", `Done after ${loop.iterations} iteration${loop.iterations === 1 ? "" : "s"}`)
       return
     }
+    this.inflight.set(id, loop)
+    let settledAs: LoopInfo | undefined
     try {
       await this.backend.prompt(id, { text: loop.prompt })
+      const cur = this.loops.get(id)
+      if (!this.destroyed && cur === loop && cur.status === "active") {
+        settledAs = { ...cur, iterations: cur.iterations + 1, reason: undefined, updatedAt: Date.now() }
+        this.loops.set(id, settledAs)
+        this.emit()
+      }
     } catch (e) {
       const cur = this.loops.get(id)
-      if (!cur || cur.status !== "active") return
-      this.loops.set(id, { ...cur, reason: `Last send failed: ${(e as Error).message}`, updatedAt: Date.now() })
-      this.emit()
+      if (!this.destroyed && cur === loop && cur.status === "active") {
+        settledAs = { ...cur, reason: `Last send failed: ${(e as Error).message}`, updatedAt: Date.now() }
+        this.loops.set(id, settledAs)
+        this.emit()
+      }
       // Retry on the next settled event or an explicit restart; don't spin.
-      return
+    } finally {
+      if (this.inflight.get(id) === loop) this.inflight.delete(id)
+      const cur = this.loops.get(id)
+      if (!this.destroyed && cur && cur !== loop && cur !== settledAs && cur.status === "active" && !this.timers.has(id)) {
+        void this.maybeKick(id)
+      }
     }
-    const cur = this.loops.get(id)
-    if (!cur || cur.status !== "active") return
-    this.loops.set(id, { ...cur, iterations: cur.iterations + 1, updatedAt: Date.now() })
-    this.emit()
   }
 
   private restore() {
@@ -384,30 +519,77 @@ export class LoopManager {
       if (!raw) return
       const arr = JSON.parse(raw) as LoopInfo[]
       if (!Array.isArray(arr)) return
+      let hasActive = false
       for (const l of arr) {
         if (!l || typeof l.sessionID !== "string" || typeof l.prompt !== "string") continue
+        let norm: ReturnType<typeof normalizeLoopOptions>
+        try {
+          norm = normalizeLoopOptions({
+            prompt: l.prompt,
+            maxIterations: l.maxIterations,
+            delayMs: l.delayMs,
+            stopPhrase: typeof l.stopPhrase === "string" ? l.stopPhrase : undefined,
+            stopOnError: typeof l.stopOnError === "boolean" ? l.stopOnError : true,
+          })
+        } catch {
+          continue
+        }
+        const iterations = Number.isFinite(l.iterations) ? Math.max(0, Math.floor(l.iterations)) : 0
+        const updatedAt = Number.isFinite(l.updatedAt) ? l.updatedAt : Date.now()
         // A reload interrupts the timer chain; resume as active so the next
         // settled event (or the kick below) continues the loop. Iteration
         // counts survive so `/loop --count` stays bounded across reloads.
         if (l.status === "active") {
-          this.loops.set(l.sessionID, { ...l, reason: undefined, updatedAt: Date.now() })
+          hasActive = true
+          this.loops.set(l.sessionID, {
+            sessionID: l.sessionID,
+            prompt: norm.prompt,
+            iterations,
+            maxIterations: norm.maxIterations,
+            delayMs: norm.delayMs,
+            stopPhrase: norm.stopPhrase,
+            stopOnError: norm.stopOnError,
+            status: "active",
+            reason: undefined,
+            updatedAt: Date.now(),
+          })
         } else if (l.status === "finished" || l.status === "stopped" || l.status === "error") {
-          this.loops.set(l.sessionID, l)
+          this.loops.set(l.sessionID, {
+            sessionID: l.sessionID,
+            prompt: norm.prompt,
+            iterations,
+            maxIterations: norm.maxIterations,
+            delayMs: norm.delayMs,
+            stopPhrase: norm.stopPhrase,
+            stopOnError: norm.stopOnError,
+            status: l.status,
+            reason: typeof l.reason === "string" ? l.reason : undefined,
+            updatedAt,
+          })
         }
       }
-      // Kick idle sessions after restore (store may not be loaded yet; the
-      // settled events + explicit kicks from the UI cover the rest).
-      setTimeout(() => {
-        for (const id of [...this.loops.keys()]) void this.maybeKick(id)
-      }, 1500)
+      if (hasActive) {
+        // Kick idle sessions after restore once Store has finished initial sync.
+        this.restoreTimer = this.timersIO.setTimeout(() => {
+          this.restoreTimer = undefined
+          if (this.destroyed) return
+          if (this.store.loaded === false) {
+            this.pendingRestoreKick = true
+            return
+          }
+          this.kickRestored()
+        }, 1500)
+      }
     } catch { /* corrupt storage */ }
   }
 
   private persist() {
     if (!this.storeIO) return
     try {
-      // Cap stored loops so one browser profile can't grow this forever.
-      const arr = [...this.loops.values()].slice(-50)
+      // Cap stored loops while always keeping active loops before evicting finished ones.
+      const arr = [...this.loops.values()]
+        .sort((a, b) => (a.status === "active" ? 1 : 0) - (b.status === "active" ? 1 : 0) || a.updatedAt - b.updatedAt)
+        .slice(-50)
       this.storeIO.setItem(STORAGE_KEY, JSON.stringify(arr))
     } catch { /* private mode */ }
   }

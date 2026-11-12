@@ -5,7 +5,7 @@ import type { Backend } from "./backend"
 import type { CanvasView } from "./canvas"
 import { CANVAS_COMMANDS, parseCommand, runCanvasCommand, sendPrompt, SlashCommands } from "./commands"
 import { basename, shellQuote, timeAgo } from "./format"
-import { DEFAULT_LOOP_PROMPT, parseLoopArgs, type LoopManager } from "./loops"
+import { DEFAULT_LOOP_PROMPT, parseLoopArgs, type LoopManager, type LoopOptions } from "./loops"
 import { defaultModel, effortLabel, modelLabel, modelRef, models, setDefaultModel, sessionModelOption, setSessionEffort } from "./models"
 import { spinner } from "./spinners"
 import type { Store } from "./store"
@@ -44,6 +44,7 @@ export class SessionPanel {
   private sendBtn: HTMLButtonElement
   private queueBtn: HTMLButtonElement
   private popover?: HTMLElement
+  private popoverKind?: string
   private drafts = new Map<string, { text: string; attachments: Array<{ uri: string; name: string }> }>()
   private changingModel = false
 
@@ -55,7 +56,11 @@ export class SessionPanel {
   private attachments: Array<{ uri: string; name: string }> = []
   private closing = false
   private closeTimer?: ReturnType<typeof setTimeout>
+  private enterTimer?: ReturnType<typeof setTimeout>
+  private focusTimer?: ReturnType<typeof setTimeout>
   private statusState = ""
+  private offStore: () => void
+  private onResize: () => void
 
   constructor(
     host: HTMLElement,
@@ -77,12 +82,14 @@ export class SessionPanel {
     this.statusEl = h("span", "head-status")
     this.modelBtn = h("button", "head-btn model") as HTMLButtonElement
     this.modelBtn.title = "Switch model"
+    this.modelBtn.addEventListener("pointerdown", (e) => e.stopPropagation())
     this.modelBtn.addEventListener("click", (e) => {
       e.stopPropagation()
       void this.toggleModels()
     })
     this.effortBtn = h("button", "head-btn effort") as HTMLButtonElement
     this.effortBtn.title = "Choose model effort"
+    this.effortBtn.addEventListener("pointerdown", (e) => e.stopPropagation())
     this.effortBtn.addEventListener("click", (e) => {
       e.stopPropagation()
       void this.showEffortPicker()
@@ -92,6 +99,7 @@ export class SessionPanel {
     left.append(this.projectEl, this.statusEl, this.modelBtn, this.effortBtn, this.autoBadge)
     const right = h("div", "head-right")
     this.subBtn = h("button", "head-btn subagents") as HTMLButtonElement
+    this.subBtn.addEventListener("pointerdown", (e) => e.stopPropagation())
     this.subBtn.addEventListener("click", (e) => {
       e.stopPropagation()
       this.toggleSubagents()
@@ -101,12 +109,14 @@ export class SessionPanel {
     this.stopBtn.addEventListener("click", () => this.interrupt())
     this.loopBtn = h("button", "head-btn loop", "Loop") as HTMLButtonElement
     this.loopBtn.title = "Loop this session: re-prompt when idle (/loop)"
+    this.loopBtn.addEventListener("pointerdown", (e) => e.stopPropagation())
     this.loopBtn.addEventListener("click", (e) => {
       e.stopPropagation()
       this.toggleLoopEditor()
     })
     this.menuBtn = h("button", "head-btn menu", "⋯") as HTMLButtonElement
     this.menuBtn.setAttribute("aria-label", "Session menu")
+    this.menuBtn.addEventListener("pointerdown", (e) => e.stopPropagation())
     this.menuBtn.addEventListener("click", (e) => {
       e.stopPropagation()
       this.toggleMenu()
@@ -157,16 +167,40 @@ export class SessionPanel {
 
     this.el.append(this.header, this.titleEl, this.line, this.transcript.scroller, composer)
     this.el.addEventListener("pointerdown", () => this.closePopover())
+    this.el.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && this.popover) {
+        e.preventDefault()
+        e.stopPropagation()
+        this.closePopover()
+      }
+    })
     host.append(this.scrim, this.el)
 
-    store.on({
+    this.offStore = store.on({
       cards: (ids) => {
         if (this.id && ids.has(this.id)) this.renderHeader()
       },
     })
-    window.addEventListener("resize", () => {
+    this.onResize = () => {
       if (this.id && !this.closing) this.applyGeometry(this.targetRect(), false)
-    })
+    }
+    window.addEventListener("resize", this.onResize)
+  }
+
+  destroy() {
+    this.offStore()
+    window.removeEventListener("resize", this.onResize)
+    clearTimeout(this.closeTimer)
+    clearTimeout(this.enterTimer)
+    clearTimeout(this.focusTimer)
+    this.closeTimer = undefined
+    this.enterTimer = undefined
+    this.focusTimer = undefined
+    this.closePopover()
+    this.slash.close()
+    this.transcript.destroy()
+    this.scrim.remove()
+    this.el.remove()
   }
 
   get isOpen() {
@@ -178,7 +212,7 @@ export class SessionPanel {
   private targetRect() {
     const vw = innerWidth
     const vh = innerHeight
-    const browser = document.querySelector<HTMLElement>(".browser-panel.visible:not(.expanded)")
+    const browser = document.querySelector<HTMLElement>(".browser-panel.visible:not(.expanded):not(.unpinned)")
     const available = browser && vw >= 1000 ? browser.getBoundingClientRect().left - 8 : vw
     const w = Math.max(280, Math.min(860, available - 32))
     const top = vw < 640 ? 12 : 24
@@ -201,14 +235,26 @@ export class SessionPanel {
     const switching = this.isOpen
     if (this.id && this.id !== id) this.saveDraft()
     clearTimeout(this.closeTimer)
+    clearTimeout(this.enterTimer)
+    clearTimeout(this.focusTimer)
     this.closeTimer = undefined
-    this.el.classList.remove("leaving")
+    this.enterTimer = undefined
+    this.focusTimer = undefined
+    this.el.classList.remove("entering", "leaving")
     this.id = id
     this.closing = false
     const draft = this.drafts.get(id)
     this.input.value = draft?.text ?? ""
     this.input.style.height = "auto"
-    this.attachments = draft?.attachments ?? []
+    if (this.input.value) {
+      requestAnimationFrame(() => {
+        if (this.id === id && !this.closing) {
+          this.input.style.height = "auto"
+          this.input.style.height = `${Math.min(220, this.input.scrollHeight)}px`
+        }
+      })
+    }
+    this.attachments = [...(draft?.attachments ?? [])]
     this.renderAttachments()
     this.statusState = ""
     this.closePopover()
@@ -226,11 +272,17 @@ export class SessionPanel {
       this.applyGeometry(from ?? new DOMRect(target.left + target.width / 2 - 150, target.top + 80, 300, 200), false)
       void this.el.offsetWidth
       this.applyGeometry(target, true)
-      setTimeout(() => this.el.classList.remove("entering"), 90)
+      this.enterTimer = setTimeout(() => {
+        this.enterTimer = undefined
+        this.el.classList.remove("entering")
+      }, 90)
     }
     this.transcript.setSession(id)
-    setTimeout(() => {
-      if (this.id === id && !this.closing && !matchMedia("(pointer: coarse)").matches) this.input.focus({ preventScroll: true })
+    this.focusTimer = setTimeout(() => {
+      this.focusTimer = undefined
+      if (this.id === id && !this.closing && !this.popover && !matchMedia("(pointer: coarse)").matches) {
+        this.input.focus({ preventScroll: true })
+      }
     }, switching ? 0 : 260)
   }
 
@@ -238,6 +290,10 @@ export class SessionPanel {
     if (!this.id || this.closing) return
     const id = this.id
     this.closing = true
+    clearTimeout(this.enterTimer)
+    clearTimeout(this.focusTimer)
+    this.enterTimer = undefined
+    this.focusTimer = undefined
     this.saveDraft()
     this.slash.close()
     this.closePopover()
@@ -252,6 +308,8 @@ export class SessionPanel {
       this.el.classList.remove("visible", "leaving", "animating")
       this.canvas.setOpen(undefined)
       this.id = undefined
+      this.attachments = []
+      this.renderAttachments()
       this.transcript.setSession(undefined)
       this.closing = false
       this.onClosed()
@@ -326,14 +384,21 @@ export class SessionPanel {
   }
 
   private startLoopFromArgs(id: string, args?: string) {
+    try {
+      this.startLoop(id, parseLoopArgs(args ?? ""))
+    } catch (e) {
+      toast(`Couldn't start loop: ${(e as Error).message}`)
+    }
+  }
+
+  private startLoop(id: string, opts: LoopOptions) {
     if (!this.loops) {
       toast("Loops aren't available here")
       return
     }
     try {
-      const opts = parseLoopArgs(args ?? "")
-      this.loops.restart(id, opts)
-      toast(opts.maxIterations === 1 ? "Loop armed: 1 iteration" : `Looping ${opts.maxIterations}×: "${opts.prompt.slice(0, 60)}"`)
+      const info = this.loops.restart(id, opts)
+      toast(info.maxIterations === 1 ? "Loop armed: 1 iteration" : `Looping ${info.maxIterations}×: "${info.prompt.slice(0, 60)}"`)
       this.renderHeader()
     } catch (e) {
       toast(`Couldn't start loop: ${(e as Error).message}`)
@@ -347,7 +412,7 @@ export class SessionPanel {
   }
 
   private toggleLoopEditor() {
-    if (this.popover) return this.closePopover()
+    if (this.popoverKind === "loop") return this.closePopover()
     const id = this.id
     if (!id || !this.loops) return
     const existing = this.loops.get(id)
@@ -386,17 +451,28 @@ export class SessionPanel {
     const hint = h("div", "pop-sub", "Re-prompts when the session goes idle. Pauses while it works or waits on you. Manual Stop ends the loop.")
     const actions = h("div", "loop-actions")
     const start = h("button", "btn primary", existing?.status === "active" ? "Restart loop" : "Start loop") as HTMLButtonElement
-    start.addEventListener("click", () => {
-      const maxIterations = Math.max(1, Math.min(200, Math.floor(Number(count.value) || 10)))
-      const delayMs = Math.max(0, Math.min(600_000, (Number(delay.value) || 0) * 1000))
-      this.startLoopFromArgs(id, [
-        prompt.value.trim() || DEFAULT_LOOP_PROMPT,
-        `--count ${maxIterations}`,
-        `--delay ${delayMs}`,
-        ...(stop.value.trim() ? [`--stop ${JSON.stringify(stop.value.trim())}`] : []),
-        ...(errBox.checked ? [] : ["--continue-on-error"]),
-      ].join(" "))
+    const submit = () => {
+      const rawCount = count.value.trim()
+      const rawDelay = delay.value.trim()
+      this.startLoop(id, {
+        prompt: prompt.value.trim() || DEFAULT_LOOP_PROMPT,
+        ...(rawCount !== "" && Number.isFinite(Number(rawCount)) ? { maxIterations: Number(rawCount) } : {}),
+        ...(rawDelay !== "" && Number.isFinite(Number(rawDelay)) ? { delayMs: Math.round(Number(rawDelay) * 1000) } : {}),
+        stopPhrase: stop.value.trim() || undefined,
+        stopOnError: errBox.checked,
+      })
       this.closePopover()
+    }
+    start.addEventListener("click", submit)
+    pop.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") {
+        e.preventDefault()
+        e.stopPropagation()
+        this.closePopover()
+      } else if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault()
+        submit()
+      }
     })
     actions.append(start)
     if (existing?.status === "active") {
@@ -414,10 +490,11 @@ export class SessionPanel {
     const r = this.loopBtn.getBoundingClientRect()
     const pr = this.el.getBoundingClientRect()
     pop.style.top = `${r.bottom - pr.top + 6}px`
-    pop.style.right = `${pr.right - r.right}px`
+    pop.style.right = `${Math.max(12, pr.right - r.right)}px`
     this.closePopover()
     this.el.append(pop)
     this.popover = pop
+    this.popoverKind = "loop"
     prompt.focus()
   }
 
@@ -425,19 +502,25 @@ export class SessionPanel {
     const id = this.id
     if (!id) return
     const t = this.titleEl
+    let done = false
     t.contentEditable = "plaintext-only"
     t.focus()
     document.getSelection()?.selectAllChildren(t)
     const finish = (commit: boolean) => {
-      t.contentEditable = "false"
+      if (done) return
+      done = true
       t.removeEventListener("keydown", onKey)
       t.removeEventListener("blur", onBlur)
+      t.contentEditable = "false"
+      t.blur()
       const title = t.textContent?.trim() ?? ""
       const s = this.store.sessions.get(id)
       if (commit && s && title && title !== s.title) {
         s.title = title
         this.store.markStructure()
         void this.transcript.act(() => this.backend.rename(id, title))
+      } else if (s) {
+        t.textContent = this.store.title(s)
       }
       this.renderHeader()
     }
@@ -459,9 +542,10 @@ export class SessionPanel {
   private closePopover() {
     this.popover?.remove()
     this.popover = undefined
+    this.popoverKind = undefined
   }
 
-  private showPopover(anchor: HTMLElement, items: Array<{ label: string; sub?: string; run: () => void; working?: boolean }>) {
+  private showPopover(anchor: HTMLElement, items: Array<{ label: string; sub?: string; run: () => void; working?: boolean }>, kind?: string) {
     this.closePopover()
     const pop = h("div", "popover")
     for (const it of items) {
@@ -480,13 +564,14 @@ export class SessionPanel {
     const r = anchor.getBoundingClientRect()
     const pr = this.el.getBoundingClientRect()
     pop.style.top = `${r.bottom - pr.top + 6}px`
-    pop.style.right = `${pr.right - r.right}px`
+    pop.style.right = `${Math.max(12, pr.right - r.right)}px`
     this.el.append(pop)
     this.popover = pop
+    this.popoverKind = kind
   }
 
   private toggleSubagents() {
-    if (this.popover) return this.closePopover()
+    if (this.popoverKind === "subagents") return this.closePopover()
     const id = this.id
     if (!id) return
     const kids = [...(this.store.children.get(id) ?? [])]
@@ -501,11 +586,13 @@ export class SessionPanel {
         working: this.store.running.has(k.id),
         run: () => this.open(k.id),
       })),
+      "subagents",
     )
   }
 
   private async toggleModels() {
-    if (this.popover) return this.closePopover()
+    if (this.popoverKind === "models") return this.closePopover()
+    if (this.changingModel) return
     const id = this.id
     const s = id ? this.store.sessions.get(id) : undefined
     if (!id || !s) return
@@ -524,6 +611,7 @@ export class SessionPanel {
     this.closePopover()
     this.el.append(pop)
     this.popover = pop
+    this.popoverKind = "models"
     list.append(h("div", "pop-empty", "Loading models…"))
     let all: Awaited<ReturnType<typeof models>>
     try {
@@ -549,14 +637,16 @@ export class SessionPanel {
           const b = h("button", `pop-item${key === current ? " current" : ""}`) as HTMLButtonElement
           b.append(h("span", "pop-label", m.name), h("span", "pop-sub", key + (pinned && `${pinned.providerID}/${pinned.id}` === key ? " · default for new sessions" : "")))
           b.addEventListener("click", async () => {
+            if (this.changingModel) return
             this.closePopover()
-            const ref = modelRef(m, s.model)
+            const latest = this.store.sessions.get(id)
+            const ref = modelRef(m, latest?.model ?? s.model)
             this.changingModel = true
             this.renderHeader()
             try {
               await this.backend.switchModel(id, ref)
-              const current = this.store.sessions.get(id)
-              if (current) current.model = ref
+              const cur = this.store.sessions.get(id)
+              if (cur) cur.model = ref
               setDefaultModel(ref)
               this.store.touchCard(id)
             } catch (e) {
@@ -586,7 +676,7 @@ export class SessionPanel {
   }
 
   async showEffortPicker() {
-    if (this.popover) return this.closePopover()
+    if (this.popoverKind === "effort") return this.closePopover()
     const id = this.id
     const s = id ? this.store.sessions.get(id) : undefined
     if (!id || !s) return
@@ -598,7 +688,7 @@ export class SessionPanel {
         label: variant === "default" ? "Default effort" : effortLabel(variant),
         sub: variant === (s.model?.variant ?? "default") ? "Current effort" : variant === "default" ? "Use OpenCode's configured effort" : undefined,
         run: () => void this.changeEffort(variant).catch((e) => toast(`Couldn't change effort: ${(e as Error).message}`)),
-      })))
+      })), "effort")
       if (!variants.length) toast("This model doesn't advertise custom effort levels")
     } catch (e) {
       toast(`Couldn't list effort levels: ${(e as Error).message}`)
@@ -633,7 +723,7 @@ export class SessionPanel {
   }
 
   private toggleMenu() {
-    if (this.popover) return this.closePopover()
+    if (this.popoverKind === "menu") return this.closePopover()
     const id = this.id
     const s = id ? this.store.sessions.get(id) : undefined
     if (!id || !s) return
@@ -643,6 +733,9 @@ export class SessionPanel {
         () => toast("Clipboard unavailable"),
       )
     }
+    const resumeCmd = s.location.directory
+      ? `cd ${shellQuote(s.location.directory)} && opencode -s ${shellQuote(id)}`
+      : `opencode -s ${shellQuote(id)}`
     const auto = this.store.sessionAutoApproves(id)
     const items = [
       auto
@@ -655,13 +748,13 @@ export class SessionPanel {
               : { label: "Pin to Tiles", sub: "Keep its chat in the tiled view", run: () => this.tiles!.togglePin(id) },
           ]
         : []),
-      { label: "Copy resume command", sub: `opencode -s ${id}`, run: () => copy(`cd ${shellQuote(s.location.directory)} && opencode -s ${shellQuote(id)}`, "resume command") },
+      { label: "Copy resume command", sub: `opencode -s ${id}`, run: () => copy(resumeCmd, "resume command") },
       { label: "Copy session ID", sub: id, run: () => copy(id, "session ID") },
       { label: "Rename", run: () => this.beginRename() },
     ]
     if (s.parentID && this.store.sessions.has(s.parentID))
       items.unshift({ label: "Open parent session", sub: this.store.title(this.store.sessions.get(s.parentID)!), run: () => this.open(s.parentID!) })
-    this.showPopover(this.menuBtn, items)
+    this.showPopover(this.menuBtn, items, "menu")
   }
 
   private async copyText(text: string) {
@@ -793,7 +886,11 @@ export class SessionPanel {
           stoploop: () => this.stopLoop(id),
           browser: (url) => this.openBrowser(url),
         })
-        if (command.name !== "help" && this.id === id && this.input.value === draft) this.input.value = ""
+        if (command.name !== "help" && this.id === id && this.input.value === draft) {
+          this.input.value = ""
+          this.input.style.height = "auto"
+          this.drafts.delete(id)
+        }
         this.slash.close()
         if (command.name === "help") this.slash.update()
       } catch (e) {
@@ -823,6 +920,8 @@ export class SessionPanel {
       this.transcript.removePending(temp)
       if (this.id === id && !this.input.value) {
         this.input.value = draft
+        this.input.style.height = "auto"
+        this.input.style.height = `${Math.min(220, this.input.scrollHeight)}px`
         this.attachments = [...(files ?? []).map((f) => ({ ...f, name: f.name ?? "image.png" })), ...this.attachments]
         this.renderAttachments()
       } else if (this.id !== id && !this.drafts.get(id)?.text) {

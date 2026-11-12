@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import type { Backend, CommandInput, PromptInput } from "../src/app/backend"
-import { CANVAS_COMMANDS, commandMatches, parseCommand, runCanvasCommand, sendPrompt } from "../src/app/commands"
+import { CANVAS_COMMANDS, SlashCommands, commandMatches, parseCommand, runCanvasCommand, sendPrompt } from "../src/app/commands"
+import { FakeEvent, withDom } from "./dom-harness"
 
 describe("slash commands", () => {
   test("parses command arguments without treating file paths as commands", () => {
@@ -49,5 +50,61 @@ describe("slash commands", () => {
     expect(browser).toBe("http://localhost:3000")
     expect(await runCanvasCommand("/review", handlers)).toBe(false)
     await expect(runCanvasCommand("/stop ignored", handlers)).rejects.toThrow("doesn't take arguments")
+  })
+
+  test("routes /loop with or without arguments and reports unavailable loop handlers", async () => {
+    let seenLoop: string | undefined = "sentinel"
+    let stopped = false
+    const handlers = {
+      help: () => {}, model: () => {}, effort: () => {}, compact: () => {}, stop: () => {}, browser: () => {},
+      loop: (args?: string) => { seenLoop = args },
+      stoploop: () => { stopped = true },
+    }
+    expect(await runCanvasCommand("/loop", handlers)).toBe(true)
+    expect(seenLoop).toBeUndefined()
+    expect(await runCanvasCommand("/loop line1\nline2 --count 2", handlers)).toBe(true)
+    expect(seenLoop).toBe("line1\nline2 --count 2")
+    expect(await runCanvasCommand("/stoploop", handlers)).toBe(true)
+    expect(stopped).toBe(true)
+
+    const noLoopHandlers = {
+      help: () => {}, model: () => {}, effort: () => {}, compact: () => {}, stop: () => {}, browser: () => {},
+    }
+    await expect(runCanvasCommand("/loop", noLoopHandlers)).rejects.toThrow("isn't available here")
+  })
+
+  test("SlashCommands UI completes options on Tab, lets exact commands execute on Enter, and guards empty choose()", async () => {
+    await withDom(async ({ document }) => {
+      const host = document.createElement("div")
+      const input = document.createElement("textarea") as unknown as HTMLTextAreaElement
+      document.body.append(host as any)
+      const backend = {
+        listCommands: async () => [{ name: "review", description: "Review diff" }],
+      } as unknown as Backend
+      const slash = new SlashCommands(input, host as unknown as HTMLElement, backend)
+      slash.open(true)
+      const menu = host.querySelector(".slash-menu")!
+      expect(menu.hidden).toBe(false)
+      expect(input.getAttribute("aria-expanded")).toBe("true")
+
+      // Tab chooses active completion and adds trailing space.
+      const tab = new FakeEvent("keydown", { key: "Tab" })
+      expect(slash.onKey(tab as unknown as KeyboardEvent)).toBe(true)
+      expect(input.value).toBe("/help ")
+      expect(menu.hidden).toBe(true)
+
+      // Exact "/stop" allows Enter to bubble back to composer rather than rewriting with space.
+      input.value = "/sto"
+      input.dispatchEvent(new FakeEvent("input") as unknown as Event)
+      expect(menu.hidden).toBe(false)
+      input.value = "/stop"
+      input.dispatchEvent(new FakeEvent("input") as unknown as Event)
+      const enter = new FakeEvent("keydown", { key: "Enter" })
+      expect(slash.onKey(enter as unknown as KeyboardEvent)).toBe(false)
+
+      // Defensive guard: out-of-bounds choose() does not throw.
+      ;(slash as unknown as { choose(i: number): void }).choose(999)
+      expect(input.value).toBe("/stop")
+    })
   })
 })
