@@ -163,6 +163,7 @@ async function boot() {
 
   root.replaceChildren()
   root.classList.add("ready")
+  let unloading = false
   let browserBtn: HTMLButtonElement | undefined
   let help: HTMLButtonElement | undefined
   let helpEl: HTMLElement | undefined
@@ -181,6 +182,7 @@ async function boot() {
   }
 
   const browser = new BrowserPanel(root, () => {
+    if (unloading) return
     browserBtn?.classList.toggle("on", browser.isOpen)
     browserBtn?.setAttribute("aria-pressed", String(browser.isOpen))
     window.dispatchEvent(new Event("resize"))
@@ -203,7 +205,7 @@ async function boot() {
 
   panel = new SessionPanel(root, store, backend, canvas, () => {
     root.classList.remove("panel-open")
-    if (!tiles.isOpen && !panel.isOpen && location.hash && location.hash !== "#tiles") {
+    if (!unloading && !tiles.isOpen && !panel.isOpen && location.hash && location.hash !== "#tiles") {
       history.replaceState(null, "", location.pathname + location.search)
     }
   }, (url) => {
@@ -211,10 +213,10 @@ async function boot() {
     browser.open(url)
   })
   panel.loops = loops
-  loops.onChange(() => panel.refreshLoop())
+  const offPanelLoop = loops.onChange(() => panel.refreshLoop())
 
   function openSession(id: string) {
-    if (!store.sessions.has(id)) return
+    if (unloading || !store.sessions.has(id)) return
     closeHelp()
     if (picker.isOpen) picker.close()
     if (tiles.isOpen) tiles.close()
@@ -256,13 +258,14 @@ async function boot() {
     newSession: () => openPicker(),
     closed: () => {
       canvas.stage.inert = false
+      if (unloading) return
       updateStats()
       if (location.hash === "#tiles") history.replaceState(null, "", location.pathname + location.search)
     },
   })
   panel.tiles = tiles
   tiles.loops = loops
-  loops.onChange(() => tiles.refreshLoops())
+  const offTilesLoop = loops.onChange(() => tiles.refreshLoops())
   function openTiles() {
     closeHelp()
     if (picker.isOpen) picker.close()
@@ -502,7 +505,7 @@ async function boot() {
     dot.title =
       s === "live" ? `Connected to OpenCode ${cfg.version ?? ""}`.trim() : s === "demo" ? "Simulated sessions" : s === "reconnecting" ? "Reconnecting…" : "Connecting…"
   }
-  store.on({ structure: updateStats, cards: updateStats, connection: updateConn })
+  const offStoreStats = store.on({ structure: updateStats, cards: updateStats, connection: updateConn })
   updateConn(store.connection)
 
   // ---- help ----
@@ -690,14 +693,22 @@ async function boot() {
   const onHashChange = () => applyHashRoute(parseHashRoute(location.hash))
   window.addEventListener("hashchange", onHashChange)
   window.addEventListener("pagehide", () => {
+    unloading = true
     clearTimeout(searchTimer)
     clearInterval(statsTimer)
     closeHelp()
+    if (picker.isOpen) picker.close()
     window.removeEventListener("keydown", onWindowKey)
     window.removeEventListener("hashchange", onHashChange)
-    store.stop()
-    browser.close()
+    offPanelLoop()
+    offTilesLoop()
+    offStoreStats()
+    loops.destroy()
+    panel.destroy()
+    tiles.destroy()
+    browser.destroy()
     canvas.destroy()
+    store.stop()
   })
   window.addEventListener("pageshow", (event) => { if (event.persisted) location.reload() })
 }
