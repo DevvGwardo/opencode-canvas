@@ -4,21 +4,41 @@
 const esc = (s: string) =>
   s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;")
 
-function inline(src: string): string {
-  const codes: string[] = []
-  let s = src.replace(/`([^`\n]+)`/g, (_, c) => {
-    codes.push(`<code>${esc(c)}</code>`)
-    return `\u0000${codes.length - 1}\u0000`
-  })
-  s = esc(s)
-  s = s.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, (_, t, u) => `<a href="${u}" target="_blank" rel="noreferrer noopener">${t}</a>`)
-  s = s.replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g, (_, pre, u) => `${pre}<a href="${u}" target="_blank" rel="noreferrer noopener">${u}</a>`)
-  s = s.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
-  s = s.replace(/__([^_\n]+)__/g, "<strong>$1</strong>")
-  s = s.replace(/(^|[^*\w])\*([^*\n]+)\*(?!\w)/g, "$1<em>$2</em>")
-  s = s.replace(/~~([^~\n]+)~~/g, "<del>$1</del>")
-  return s.replace(/\u0000(\d+)\u0000/g, (_, i) => codes[Number(i)])
+function emphasize(s: string): string {
+  return s
+    .replace(/\*\*(?!\s)((?:[^*\n]|\*(?!\*))+?)(?<!\s)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[^\w])__(?!\s)((?:[^_\n]|_(?!_))+?)(?<!\s)__(?!\w)/g, "$1<strong>$2</strong>")
+    .replace(/(^|[^*\w])\*(?!\s)([^*\n]+?)(?<!\s)\*(?!\w)/g, "$1<em>$2</em>")
+    .replace(/~~(?!\s)((?:[^~\n]|~(?!~))+?)(?<!\s)~~/g, "<del>$1</del>")
 }
+
+function inline(src: string): string {
+  const slots: string[] = []
+  const stash = (html: string) => {
+    slots.push(html)
+    return `\u0000${slots.length - 1}\u0000`
+  }
+  let s = src.replace(/\u0000/g, "").replace(/(`+)(?!`)(.+?)(?<!`)\1(?!`)/g, (_, __, c) => stash(`<code>${esc(c)}</code>`))
+  s = esc(s)
+  const expand = (text: string) => text.replace(/\u0000(\d+)\u0000/g, (_, i) => slots[Number(i)] ?? "")
+  // Stash complete <a> tags before emphasis/autolink so href attributes are never rewritten.
+  s = s.replace(
+    /\[([^\]\n]+)\]\((https?:\/\/(?:[^\s()<>]+|\([^\s()<>]*\))+)\)/gi,
+    (_, t, u) => stash(`<a href="${u}" target="_blank" rel="noreferrer noopener">${expand(emphasize(t))}</a>`),
+  )
+  s = s.replace(
+    /(^|[\s(]|&(?:quot|lt);)(https?:\/\/(?:(?:(?!&(?:quot|lt|gt);)[^\s()<>])+|\((?:(?!&(?:quot|lt|gt);)[^\s()<>])*\))+)/gi,
+    (_, pre, u) => {
+      const trimmed = u.replace(/[.,;:!?]+$/, "")
+      const tail = u.slice(trimmed.length)
+      return `${pre}${stash(`<a href="${trimmed}" target="_blank" rel="noreferrer noopener">${trimmed}</a>`)}${tail}`
+    },
+  )
+  return expand(emphasize(s))
+}
+
+const matchFence = (line: string) => line.match(/^\s*(`{3,})([^`]*)$/) ?? line.match(/^\s*(~{3,})(.*)$/)
+const isHr = (line: string) => /^\s*([-*_])(\s*\1){2,}\s*$/.test(line)
 
 export function renderMarkdown(src: string): string {
   const lines = src.replace(/\r\n/g, "\n").split("\n")
@@ -27,13 +47,16 @@ export function renderMarkdown(src: string): string {
   while (i < lines.length) {
     const line = lines[i]
 
-    const fence = line.match(/^\s*(```|~~~)\s*([\w+-]*)/)
+    const fence = matchFence(line)
     if (fence) {
+      const marker = fence[1]
+      const lang = fence[2].trim().split(/\s+/)[0] ?? ""
+      const closeRe = new RegExp(`^\\s*${marker[0]}{${marker.length},}\\s*$`)
       const body: string[] = []
       i++
-      while (i < lines.length && !lines[i].trim().startsWith(fence[1])) body.push(lines[i++])
-      i++
-      out.push(`<pre><code${fence[2] ? ` data-lang="${esc(fence[2])}"` : ""}>${esc(body.join("\n"))}</code></pre>`)
+      while (i < lines.length && !closeRe.test(lines[i])) body.push(lines[i++])
+      if (i < lines.length) i++
+      out.push(`<pre><code${lang ? ` data-lang="${esc(lang)}"` : ""}>${esc(body.join("\n"))}</code></pre>`)
       continue
     }
 
@@ -50,7 +73,7 @@ export function renderMarkdown(src: string): string {
       continue
     }
 
-    if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)) {
+    if (isHr(line)) {
       out.push("<hr>")
       i++
       continue
@@ -89,6 +112,7 @@ export function renderMarkdown(src: string): string {
       while (i < lines.length) {
         const m = lines[i].match(/^(\s*)([-*+]|\d+[.)])\s+(.*)$/)
         if (m) {
+          if (/\d/.test(m[2]) !== ordered) break
           const nested = m[1].length >= 2
           const task = m[3].match(/^\[([ xX])\]\s+(.*)$/)
           const body = task
@@ -97,7 +121,7 @@ export function renderMarkdown(src: string): string {
           items.push(`<li${nested ? ' class="nested"' : ""}>${body}</li>`)
           i++
         } else if (lines[i].trim() && /^\s{2,}/.test(lines[i]) && items.length) {
-          items[items.length - 1] = items[items.length - 1].replace(/<\/li>$/, ` ${inline(lines[i].trim())}</li>`)
+          items[items.length - 1] = items[items.length - 1].replace(/<\/li>$/, () => ` ${inline(lines[i].trim())}</li>`)
           i++
         } else break
       }
@@ -109,8 +133,10 @@ export function renderMarkdown(src: string): string {
     while (
       i < lines.length &&
       lines[i].trim() &&
-      !/^\s*(```|~~~|#{1,6}\s|>|([-*+]|\d+[.)])\s)/.test(lines[i]) &&
-      !/^\s*\|.*\|\s*$/.test(lines[i])
+      !matchFence(lines[i]) &&
+      !isHr(lines[i]) &&
+      !/^\s*(#{1,6}\s|>|([-*+]|\d+[.)])\s)/.test(lines[i]) &&
+      !(/^\s*\|.*\|\s*$/.test(lines[i]) && i + 1 < lines.length && /^\s*\|?\s*:?-{2,}/.test(lines[i + 1]))
     ) {
       para.push(lines[i++])
     }
@@ -125,7 +151,7 @@ export function renderMarkdown(src: string): string {
 
 /** Plain-text preview: markdown syntax stripped, list items kept as bullets. */
 export function previewBlocks(src: string): { text: string; bullets: string[] } {
-  const lines = src.replace(/```[\s\S]*?```/g, "").split("\n")
+  const lines = src.replace(/\r\n/g, "\n").replace(/(?:```|~~~)[\s\S]*?(?:```|~~~)/g, "").split("\n")
   const text: string[] = []
   const bullets: string[] = []
   for (const raw of lines) {

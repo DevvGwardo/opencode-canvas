@@ -64,19 +64,21 @@ function save(key: string, v: unknown) {
 
 /** Grid that fills the area with tiles as close to 4:3 as possible. */
 export function gridFor(n: number, w: number, hgt: number) {
-  if (n <= 0) return { cols: 1, rows: 1, rowH: hgt }
+  const width = Math.max(1, w)
+  const height = Math.max(1, hgt)
+  if (n <= 0) return { cols: 1, rows: 1, rowH: height }
   let best = { cols: 1, rows: n, score: Infinity }
   for (let cols = 1; cols <= n; cols++) {
-    const tw = (w - GAP * (cols - 1)) / cols
+    const tw = Math.max(1, (width - GAP * (cols - 1)) / cols)
     if (tw < MIN_TILE_W && cols > 1) break
     const rows = Math.ceil(n / cols)
-    const th = (hgt - GAP * (rows - 1)) / rows
+    const th = (height - GAP * (rows - 1)) / rows
     const tooShort = th < MIN_TILE_H ? (MIN_TILE_H - th) / MIN_TILE_H : 0
     const empty = (cols * rows - n) / (cols * rows)
     const score = Math.abs(Math.log(tw / Math.max(th, MIN_TILE_H) / 1.33)) + tooShort * 2 + empty * 0.8
     if (score < best.score) best = { cols, rows, score }
   }
-  const rowH = Math.max(MIN_TILE_H, (hgt - GAP * (best.rows - 1)) / best.rows)
+  const rowH = Math.max(MIN_TILE_H, (height - GAP * (best.rows - 1)) / best.rows)
   return { cols: best.cols, rows: best.rows, rowH }
 }
 
@@ -96,6 +98,7 @@ class Tile {
   private modelBtn: HTMLButtonElement
   private sendBtn: HTMLButtonElement
   private state = ""
+  private destroyed = false
 
   constructor(
     readonly id: string,
@@ -146,6 +149,14 @@ class Tile {
     const directory = store.sessions.get(id)?.location.directory
     if (directory) this.slash.setDirectory(directory)
     this.input.value = this.view.drafts.get(id) ?? ""
+    if (this.input.value) {
+      requestAnimationFrame(() => {
+        if (!this.destroyed) {
+          this.input.style.height = "auto"
+          this.input.style.height = `${Math.min(120, this.input.scrollHeight)}px`
+        }
+      })
+    }
     this.bindComposer()
 
     this.root.append(head, this.transcript.scroller, composer)
@@ -299,7 +310,7 @@ class Tile {
             this.store.touchCard(this.id)
           },
           compact: async () => { await this.backend.compact(this.id, delivery); this.transcript.scheduleRefetch(80) },
-          stop: () => this.backend.interrupt(this.id),
+          stop: () => this.transcript.act(() => this.backend.interrupt(this.id)),
           loop: (args) => {
             if (!this.view.loops) return toast("Loops aren't available here")
             try {
@@ -315,8 +326,13 @@ class Tile {
           },
           browser: (url) => this.view.openBrowser(url),
         })
-        if (command.name !== "help" && this.input.value === draft) this.input.value = ""
-        if (command.name !== "help") this.view.drafts.delete(this.id)
+        if (command.name !== "help" && !this.destroyed && this.input.value === draft) {
+          this.input.value = ""
+          this.input.style.height = "auto"
+          this.view.drafts.delete(this.id)
+        }
+        this.slash.close()
+        if (command.name === "help") this.slash.update()
       } catch (e) {
         toast((e as Error).message)
       }
@@ -333,8 +349,15 @@ class Tile {
       this.transcript.scheduleRefetch(80)
     } catch (e) {
       this.transcript.removePending(temp)
-      if (!this.input.value) this.input.value = draft
-      if (!this.root.isConnected && !this.view.drafts.get(this.id)) this.view.drafts.set(this.id, draft)
+      if (!this.destroyed) {
+        if (!this.input.value) {
+          this.input.value = draft
+          this.input.style.height = "auto"
+          this.input.style.height = `${Math.min(120, this.input.scrollHeight)}px`
+        }
+      } else if (!this.view.drafts.get(this.id) && !this.view.hasTile(this.id)) {
+        this.view.drafts.set(this.id, draft)
+      }
       toast(`Couldn't send: ${(e as Error).message}`)
     }
   }
@@ -344,6 +367,7 @@ class Tile {
   }
 
   destroy() {
+    this.destroyed = true
     if (this.input.value) this.view.drafts.set(this.id, this.input.value)
     else this.view.drafts.delete(this.id)
     this.slash.close()
@@ -371,6 +395,9 @@ export class TilesView {
   maximized?: string
   private open_ = false
   private syncQueued = false
+  private offStore: () => void
+  private resizeObserver: ResizeObserver
+  private tickTimer: ReturnType<typeof setInterval>
 
   constructor(
     host: HTMLElement,
@@ -411,7 +438,7 @@ export class TilesView {
     this.el.append(bar, this.grid, this.empty)
     host.append(this.el)
 
-    store.on({
+    this.offStore = store.on({
       structure: () => this.queueSync(),
       cards: (ids) => {
         if (!this.open_) return
@@ -429,10 +456,23 @@ export class TilesView {
         else if (touched) this.renderCounts()
       },
     })
-    new ResizeObserver(() => this.layout()).observe(this.grid)
-    setInterval(() => {
+    this.resizeObserver = new ResizeObserver(() => this.layout())
+    this.resizeObserver.observe(this.grid)
+    this.tickTimer = setInterval(() => {
       if (this.open_) for (const t of this.tiles.values()) t.update()
     }, 30_000)
+  }
+
+  hasTile(id: string) {
+    return this.tiles.has(id)
+  }
+
+  destroy() {
+    this.close()
+    this.offStore()
+    this.resizeObserver.disconnect()
+    clearInterval(this.tickTimer)
+    this.el.remove()
   }
 
   get isOpen() {

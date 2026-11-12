@@ -1,12 +1,47 @@
+import { existsSync } from "node:fs"
+import { dirname, join } from "node:path"
 import { describe, expect, test } from "bun:test"
-import { basename, compactionLabel, describeTool, matchesQuery, shellQuote, summarizeTools, timeAgo, toolRow } from "../src/app/format"
+import { basename, compactionLabel, describeTool, matchesQuery, shellQuote, summarizeTools, timeAgo, toolOutput, toolRow, truncate } from "../src/app/format"
 import { previewBlocks, renderMarkdown } from "../src/app/markdown"
 import { buildPreview } from "../src/app/store"
 import type { Message } from "../src/app/types"
 
-test("resume commands quote paths without expanding shell syntax", async () => {
+function findSh(): string | undefined {
+  const direct = Bun.which("sh")
+  if (direct) return direct
+  if (process.platform !== "win32") return undefined
+  const roots = new Set<string>()
+  const git = Bun.which("git")
+  if (git) roots.add(dirname(dirname(git)))
+  if (process.env.ProgramFiles) roots.add(join(process.env.ProgramFiles, "Git"))
+  if (process.env["ProgramFiles(x86)"]) roots.add(join(process.env["ProgramFiles(x86)"], "Git"))
+  if (process.env.LOCALAPPDATA) roots.add(join(process.env.LOCALAPPDATA, "Programs", "Git"))
+  for (const root of roots) {
+    for (const rel of ["bin\\sh.exe", "usr\\bin\\sh.exe"]) {
+      const candidate = join(root, rel)
+      if (existsSync(candidate)) return candidate
+    }
+  }
+  return undefined
+}
+
+const sh = findSh()
+
+test("shellQuote wraps POSIX shell metacharacters without single-quote leaks", () => {
+  expect(shellQuote("/code/app with spaces")).toBe("'/code/app with spaces'")
+  expect(shellQuote("/code/it's a project")).toBe("'/code/it'\\''s a project'")
+  expect(shellQuote("/code/$HOME/$(printf expanded)")).toBe("'/code/$HOME/$(printf expanded)'")
+  expect(shellQuote("/code/line\nbreak")).toBe("'/code/line\nbreak'")
+  expect(shellQuote("")).toBe("''")
+})
+
+test.skipIf(!sh)("resume commands quote paths without expanding shell syntax", async () => {
   for (const value of ["/code/app with spaces", "/code/it's a project", "/code/$HOME/$(printf expanded)", "/code/line\nbreak"]) {
-    const proc = Bun.spawn(["sh", "-c", `printf %s ${shellQuote(value)}`], { stdout: "pipe", stderr: "pipe" })
+    const proc = Bun.spawn([sh!, "-c", `printf %s ${shellQuote(value)}`], {
+      stdout: "pipe",
+      stderr: "pipe",
+      env: { ...process.env, MSYS_NO_PATHCONV: "1" },
+    })
     expect(await new Response(proc.stdout).text()).toBe(value)
     expect(await proc.exited).toBe(0)
   }
@@ -51,6 +86,17 @@ describe("tool labels", () => {
   test("past tense rows", () => {
     expect(toolRow("read", { path: "web/a.ts" })).toEqual(["Read", "web/a.ts"])
     expect(toolRow("shell", { command: "bun test" })).toEqual(["Ran", "bun test"])
+  })
+
+  test("handles non-string inputs, CRLF commands, and non-array tool output safely", () => {
+    expect(basename(123 as unknown as string)).toBe("123")
+    expect(describeTool("read", { path: 42 as unknown as string })).toBe("Reading 42…")
+    expect(describeTool("shell", { command: "\r\ngit status\r\necho ok" })).toBe("Running git status…")
+    expect(toolRow("shell", { command: "bun test\r\necho ok" })).toEqual(["Ran", "bun test"])
+    expect(describeTool("webfetch", { url: 99 as unknown as string })).toBe("Fetching a page…")
+    expect(truncate("abcdef", 0)).toBe("")
+    expect(truncate("abcdef", 1)).toBe("…")
+    expect(toolOutput({ status: "completed", content: "unexpected" as unknown as [] })).toBe("")
   })
 })
 

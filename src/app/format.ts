@@ -4,9 +4,10 @@ import type { AssistantPart, ToolState } from "./types"
 
 export function basename(p?: string | null): string {
   if (!p) return ""
+  const s = typeof p === "string" ? p : String(p)
   // Windows paths use "\" separators, so split on either and drop trailing ones.
-  const parts = p.replace(/[\\/]+$/, "").split(/[\\/]/)
-  return parts[parts.length - 1] || p
+  const parts = s.replace(/[\\/]+$/, "").split(/[\\/]/)
+  return parts[parts.length - 1] || s
 }
 
 export function shellQuote(value: string): string {
@@ -14,8 +15,9 @@ export function shellQuote(value: string): string {
 }
 
 export function truncate(s: string, n: number): string {
-  s = s.replace(/\s+/g, " ").trim()
-  return s.length > n ? s.slice(0, n - 1) + "…" : s
+  s = String(s ?? "").replace(/\s+/g, " ").trim()
+  if (n <= 0) return ""
+  return s.length > n ? s.slice(0, Math.max(0, n - 1)) + "…" : s
 }
 
 export function timeAgo(ms: number, now = Date.now()): string {
@@ -32,18 +34,20 @@ export function timeAgo(ms: number, now = Date.now()): string {
 }
 
 function host(url?: string) {
+  if (typeof url !== "string") return ""
   try {
     return url ? new URL(url).host : ""
   } catch {
-    return url ?? ""
+    return url
   }
 }
 
 const pathOf = (input?: Record<string, any>) =>
   input?.path ?? input?.filePath ?? input?.file_path ?? input?.file ?? input?.target
 
-function firstLine(s?: string) {
-  return (s ?? "").split("\n").find((l) => l.trim()) ?? ""
+function firstLine(s?: unknown) {
+  const str = typeof s === "string" ? s : s == null ? "" : String(s)
+  return str.split(/\r?\n/).find((l) => l.trim()) ?? ""
 }
 
 /** Present-tense label for a running tool: "Reading sessions.ts…". */
@@ -216,7 +220,8 @@ export function toolOutput(state: ToolState): string {
     const e = state.error
     return typeof e === "string" ? e : (e?.message ?? JSON.stringify(e ?? {}, null, 2))
   }
-  const text = (state.content ?? [])
+  const content = Array.isArray(state.content) ? state.content : []
+  const text = content
     .map((c) => (c.type === "text" ? (c.text ?? "") : c.name ? `[${c.name}]` : `[${c.type}]`))
     .join("\n")
   return text

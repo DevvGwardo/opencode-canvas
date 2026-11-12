@@ -63,6 +63,7 @@ export class Transcript {
   private expanded = new Set<string>()
   private refetchTimer?: ReturnType<typeof setTimeout>
   private renderQueued = false
+  private pendingScrollEnd = false
   private loadSeq = 0
   private sessionSeq = 0
   private off: () => void
@@ -96,6 +97,7 @@ export class Transcript {
   setSession(id: string | undefined) {
     this.sessionSeq++
     this.loadSeq++
+    this.pendingScrollEnd = false
     this.id = id
     this.messages = []
     this.inbox = []
@@ -128,6 +130,8 @@ export class Transcript {
   destroy() {
     this.off()
     if (this.refetchTimer) clearTimeout(this.refetchTimer)
+    this.refetchTimer = undefined
+    this.pendingScrollEnd = false
     this.id = undefined
     this.sessionSeq++
     this.loadSeq++
@@ -136,6 +140,7 @@ export class Transcript {
   async load(scrollToEnd: boolean) {
     const id = this.id
     if (!id) return
+    if (scrollToEnd) this.pendingScrollEnd = true
     const seq = ++this.loadSeq
     try {
       const [page, inbox] = await Promise.all([
@@ -144,11 +149,13 @@ export class Transcript {
       ])
       if (seq !== this.loadSeq || id !== this.id) return
       const latest = [...page.data].reverse()
+      const toEnd = scrollToEnd || this.pendingScrollEnd
+      this.pendingScrollEnd = false
       // A transient empty snapshot (e.g. while plugins settle) must not wipe the
       // transcript we already loaded.
       if (!latest.length && this.messages.length) {
         this.inbox = inbox
-        this.render(scrollToEnd)
+        this.render(toEnd)
         return
       }
       // Keep any older pages already loaded above the newest page.
@@ -167,7 +174,7 @@ export class Transcript {
         this.cursorOlder = page.data.length >= this.opts.pageSize ? page.cursor?.next : undefined
       }
       this.inbox = inbox
-      this.render(scrollToEnd)
+      this.render(toEnd)
     } catch (e) {
       if (id === this.id && seq === this.loadSeq) toast(`Couldn't load session: ${(e as Error).message}`)
     }
@@ -243,37 +250,46 @@ export class Transcript {
     const d = ev.data
     switch (ev.type) {
       case "session.step.started": {
+        if (!d?.assistantMessageID) break
         const m = this.assistant(d.assistantMessageID)
         m.agent = d.agent ?? m.agent
         m.model = d.model ?? m.model
         break
       }
       case "session.text.started":
+        if (!d?.assistantMessageID) break
         this.nthPart(this.assistant(d.assistantMessageID), "text", d.ordinal ?? 0)
         break
       case "session.text.delta":
+        if (!d?.assistantMessageID) break
         this.nthPart(this.assistant(d.assistantMessageID), "text", d.ordinal ?? 0).text += d.delta ?? ""
         break
       case "session.reasoning.started":
+        if (!d?.assistantMessageID) break
         this.nthPart(this.assistant(d.assistantMessageID), "reasoning", d.ordinal ?? 0)
         break
       case "session.reasoning.delta":
+        if (!d?.assistantMessageID) break
         this.nthPart(this.assistant(d.assistantMessageID), "reasoning", d.ordinal ?? 0).text += d.delta ?? ""
         break
       case "session.tool.input.started":
+        if (!d?.assistantMessageID || !d?.id) break
         this.toolPart(this.assistant(d.assistantMessageID), d.id, d.name)
         break
       case "session.tool.called": {
+        if (!d?.assistantMessageID || !d?.id) break
         const p = this.toolPart(this.assistant(d.assistantMessageID), d.id)
         p.state = { status: "running", input: d.input, metadata: {} }
         break
       }
       case "session.tool.success": {
+        if (!d?.assistantMessageID || !d?.id) break
         const p = this.toolPart(this.assistant(d.assistantMessageID), d.id)
         p.state = { status: "completed", input: p.state.input, content: d.content, metadata: d.metadata }
         break
       }
       case "session.tool.failed": {
+        if (!d?.assistantMessageID || !d?.id) break
         const p = this.toolPart(this.assistant(d.assistantMessageID), d.id)
         p.state = { status: "error", input: p.state.input, error: d.error ?? d.message ?? "Tool failed" }
         break
@@ -292,6 +308,7 @@ export class Transcript {
       case "session.execution.started":
       case "session.shell.started":
       case "session.shell.ended":
+      case "session.compaction.started":
       case "session.compaction.ended":
       case "session.compaction.failed":
       case "session.model.selected":
@@ -450,7 +467,7 @@ export class Transcript {
         const body = h("div", "body")
         body.append(h("div", "user-text", b.text))
         for (const f of b.files) {
-          if (f.src && f.mime.startsWith("image/")) {
+          if (f.src && f.mime?.startsWith("image/")) {
             const img = h("img", "attachment") as HTMLImageElement
             img.src = f.src
             img.alt = f.name ?? "image"
@@ -564,7 +581,7 @@ export class Transcript {
     const row = h("div", `msg inbox ${item.delivery}`)
     row.append(h("div", "gutter", item.delivery === "queue" ? "Queued" : "Steering"))
     const body = h("div", "body")
-    body.append(h("div", "user-text", item.payload?.text ?? `(${item.type})`))
+    body.append(h("div", "user-text", item.payload?.text ?? (item.type === "compaction" ? "Context compaction" : `(${item.type})`)))
     const actions = h("div", "inbox-actions")
     if (item.delivery === "queue") {
       const steer = h("button", "link", "Send now") as HTMLButtonElement
@@ -626,25 +643,27 @@ export class Transcript {
   }
 
   private renderForm(form: FormInfo) {
+    const seq = this.sessionSeq
     const row = h("div", "msg ask")
     row.append(h("div", "gutter", "Question"))
     row.append(questionForm(form,
       async (answer) => {
         await this.store.replyForm(form, answer)
-        this.scheduleRefetch(50)
+        if (seq === this.sessionSeq && this.id) this.scheduleRefetch(50)
       },
       async () => {
         await this.store.cancelForm(form)
-        this.scheduleRefetch(50)
+        if (seq === this.sessionSeq && this.id) this.scheduleRefetch(50)
       },
     ))
     return row
   }
 
   async act(fn: () => Promise<unknown>) {
+    const seq = this.sessionSeq
     try {
       await fn()
-      this.scheduleRefetch(50)
+      if (seq === this.sessionSeq && this.id) this.scheduleRefetch(50)
     } catch (e) {
       toast((e as Error).message)
     }

@@ -27,6 +27,7 @@ export class BrowserPanel {
   private tabs: HTMLElement
   private dialog: HTMLElement
   private deviceBtn: HTMLButtonElement
+  private maxBtn: HTMLButtonElement
   private pinBtn: HTMLButtonElement
   private pinned = loadPinned()
   private width = BROWSER_WIDTH
@@ -41,6 +42,7 @@ export class BrowserPanel {
   private requests: Promise<void> = Promise.resolve()
   private generation = 0
   private previousFocus?: HTMLElement
+  private onVisibility: () => void
 
   constructor(host: HTMLElement, private onChange: () => void) {
     this.el = h("section", "browser-panel")
@@ -49,13 +51,16 @@ export class BrowserPanel {
     const close = this.button("Close", "Close browser panel", () => this.close())
     this.deviceBtn = this.button("Phone layout", "Switch browser between desktop and phone layouts", () =>
       this.send({ type: "viewport", mode: this.width === BROWSER_WIDTH ? "phone" : "desktop" }))
-    const maximize = this.button("Expand", "Toggle full-size browser", () => {
+    this.maxBtn = this.button("Expand", "Toggle full-size browser", () => {
       if (!this.pinned) this.togglePin()
-      this.el.classList.toggle("expanded")
+      const expanded = this.el.classList.toggle("expanded")
+      this.maxBtn.classList.toggle("on", expanded)
+      this.maxBtn.setAttribute("aria-pressed", String(expanded))
       this.onChange()
     })
+    this.maxBtn.setAttribute("aria-pressed", "false")
     this.pinBtn = this.button("", "Pin the browser panel", () => this.togglePin())
-    head.append(h("strong", "", "Browser"), h("span", "browser-note", "Isolated Chrome · shared on this host"), this.pinBtn, this.deviceBtn, maximize, close)
+    head.append(h("strong", "", "Browser"), h("span", "browser-note", "Isolated Chrome · shared on this host"), this.pinBtn, this.deviceBtn, this.maxBtn, close)
     const toolbar = h("form", "browser-toolbar")
     this.address = h("input") as HTMLInputElement
     this.address.type = "text"
@@ -107,11 +112,19 @@ export class BrowserPanel {
       e.stopPropagation()
       if (e.key === "Escape" && e.target !== this.viewport) this.close()
     })
-    document.addEventListener("visibilitychange", () => {
+    this.onVisibility = () => {
       if (!this.open_) return
       if (document.hidden) this.disconnect()
       else void this.connect()
-    })
+    }
+    document.addEventListener("visibilitychange", this.onVisibility)
+  }
+
+  destroy() {
+    document.removeEventListener("visibilitychange", this.onVisibility)
+    this.close()
+    document.documentElement.classList.remove("browser-unpinned")
+    this.el.remove()
   }
 
   get isOpen() { return this.open_ }
@@ -137,7 +150,11 @@ export class BrowserPanel {
 
   private togglePin() {
     this.pinned = !this.pinned
-    if (!this.pinned) this.el.classList.remove("expanded")
+    if (!this.pinned) {
+      this.el.classList.remove("expanded")
+      this.maxBtn.classList.remove("on")
+      this.maxBtn.setAttribute("aria-pressed", "false")
+    }
     this.el.classList.toggle("unpinned", !this.pinned)
     document.documentElement.classList.toggle("browser-unpinned", !this.pinned)
     try {
@@ -170,20 +187,26 @@ export class BrowserPanel {
   }
 
   close() {
+    if (!this.open_) return
     this.open_ = false
+    this.pendingUrl = undefined
     this.disconnect()
     this.el.classList.remove("visible", "expanded")
+    this.maxBtn.classList.remove("on")
+    this.maxBtn.setAttribute("aria-pressed", "false")
     document.documentElement.classList.remove("browser-open")
-    this.dialog.hidden = true
     this.image.removeAttribute("src")
     this.image.hidden = true
     this.onChange()
-    this.previousFocus?.focus()
+    const prev = this.previousFocus
+    this.previousFocus = undefined
+    prev?.focus()
   }
 
   private disconnect() {
     this.generation++
     this.ready = false
+    this.dialog.hidden = true
     this.stream?.close()
     this.stream = undefined
     clearTimeout(this.wheelTimer)
@@ -197,7 +220,13 @@ export class BrowserPanel {
     try {
       const res = await fetch("/canvas/browser")
       if (!res.ok) throw new Error(res.status === 401 ? "Canvas login expired. Reload to sign in." : `Browser unavailable (${res.status})`)
-      const state = await res.json()
+      const body = await res.text()
+      let state: { available?: boolean; running?: boolean }
+      try {
+        state = body ? JSON.parse(body) : {}
+      } catch {
+        throw new Error("Browser returned an invalid status response.")
+      }
       if (!state.available) throw new Error("Install Chrome/Chromium on the host, or set CANVAS_BROWSER_BIN.")
       if (!this.open_ || generation !== this.generation || document.hidden) return
       const stream = new EventSource("/canvas/browser/events")
@@ -274,11 +303,15 @@ export class BrowserPanel {
         method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(action),
       })
       if (!res.ok) throw new Error(actionErrorMessage(res.status, await res.text()))
-    }).catch((e) => { this.status.textContent = (e as Error).message })
+    }).catch((e) => {
+      if (generation === this.generation && this.open_) this.status.textContent = (e as Error).message
+    })
   }
 
   private point(clientX: number, clientY: number) {
+    if (this.image.hidden) return undefined
     const rect = this.image.getBoundingClientRect()
+    if (rect.width <= 0 || rect.height <= 0) return undefined
     return {
       x: Math.max(0, Math.min(this.width, (clientX - rect.left) / rect.width * this.width)),
       y: Math.max(0, Math.min(this.height, (clientY - rect.top) / rect.height * this.height)),
@@ -290,15 +323,18 @@ export class BrowserPanel {
     let suppressClick = 0
     this.image.addEventListener("click", (e) => {
       if (Date.now() < suppressClick) return
+      const p = this.point(e.clientX, e.clientY)
+      if (!p) return
       this.viewport.focus()
-      this.send({ type: "click", ...this.point(e.clientX, e.clientY) })
+      this.send({ type: "click", ...p })
     })
     this.image.addEventListener("wheel", (e) => {
       e.preventDefault()
-      const point = this.point(e.clientX, e.clientY)
+      const p = this.point(e.clientX, e.clientY)
+      if (!p) return
       const factor = e.deltaMode === 1 ? 20 : e.deltaMode === 2 ? this.height : 1
       this.wheel = {
-        ...point,
+        ...p,
         deltaX: Math.max(-4000, Math.min(4000, (this.wheel?.deltaX ?? 0) + e.deltaX * factor)),
         deltaY: Math.max(-4000, Math.min(4000, (this.wheel?.deltaY ?? 0) + e.deltaY * factor)),
       }
@@ -324,8 +360,13 @@ export class BrowserPanel {
       const dy = start.y - e.clientY
       const rect = this.image.getBoundingClientRect()
       if (Math.abs(dx) + Math.abs(dy) > 10) {
-        this.send({ type: "scroll", ...this.point(start.x, start.y), deltaX: Math.max(-4000, Math.min(4000, dx / rect.width * this.width)), deltaY: Math.max(-4000, Math.min(4000, dy / rect.height * this.height)) })
-      } else this.send({ type: "click", ...this.point(e.clientX, e.clientY) })
+        const p = this.point(start.x, start.y)
+        if (!p || rect.width <= 0 || rect.height <= 0) return
+        this.send({ type: "scroll", ...p, deltaX: Math.max(-4000, Math.min(4000, dx / rect.width * this.width)), deltaY: Math.max(-4000, Math.min(4000, dy / rect.height * this.height)) })
+      } else {
+        const p = this.point(e.clientX, e.clientY)
+        if (p) this.send({ type: "click", ...p })
+      }
     })
     this.image.addEventListener("pointercancel", () => { touch = undefined })
     this.viewport.addEventListener("keydown", (e) => {
@@ -346,10 +387,28 @@ export class BrowserPanel {
     input.setAttribute("aria-label", "Browser dialog answer")
     input.hidden = event.kind !== "prompt"
     const respond = (accept: boolean) => {
-      this.send({ type: "dialog", accept, text: input.value })
+      if (this.dialog.hidden) return
       this.dialog.hidden = true
+      this.send({ type: "dialog", accept, text: input.value })
     }
-    this.dialog.replaceChildren(label, input, this.button("Cancel", "Dismiss browser dialog", () => respond(false)), this.button("OK", "Accept browser dialog", () => respond(true)))
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault()
+        respond(true)
+      }
+    })
+    this.dialog.onkeydown = (e) => {
+      e.stopPropagation()
+      if (e.key === "Escape") {
+        e.preventDefault()
+        respond(false)
+      }
+    }
+    const cancel = this.button("Cancel", "Dismiss browser dialog", () => respond(false))
+    const ok = this.button("OK", "Accept browser dialog", () => respond(true))
+    this.dialog.replaceChildren(label, input, cancel, ok)
     this.dialog.hidden = false
+    if (event.kind === "prompt") input.focus()
+    else ok.focus()
   }
 }

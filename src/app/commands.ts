@@ -158,7 +158,9 @@ export class SlashCommands {
   }
 
   private choose(index: number) {
-    this.input.value = `/${this.options[index].name} `
+    const option = this.options[index]
+    if (!option) return
+    this.input.value = `/${option.name} `
     this.dismissed = true
     this.close()
     this.input.focus()
