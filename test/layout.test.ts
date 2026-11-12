@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { CARD_W, LAYOUTS, layout, type LayoutGroup, type Placement } from "../src/app/layouts"
+import { CARD_W, formatCost, LAYOUTS, layout, type LayoutGroup, type Placement } from "../src/app/layouts"
 
 function groups(sizes: number[]): LayoutGroup[] {
   return sizes.map((n, g) => ({
@@ -146,5 +146,77 @@ describe("layouts", () => {
         expect(r.cards.get("a1x")!.x).toBe(r.cards.get("root")!.x)
       }
     })
+
+    test("orphan subagents and cyclic parent pointers degrade to roots safely", () => {
+      const broken: LayoutGroup[] = [
+        {
+          key: "g",
+          label: "broken",
+          items: [
+            { id: "orphan", kind: "session", h: 150, updated: 5, parent: "missing" },
+            { id: "c1", kind: "session", h: 150, updated: 4, parent: "c2" },
+            { id: "c2", kind: "session", h: 150, updated: 3, parent: "c1" },
+          ],
+        },
+      ]
+      const r = layout("agents", broken, {})
+      for (const id of ["orphan", "c1", "c2"]) {
+        const p = r.cards.get(id)!
+        expect(p).toBeDefined()
+        expect(p.opacity).toBe(1)
+        expect(p.interactive).toBe(true)
+        expect(Number.isFinite(p.x) && Number.isFinite(p.y)).toBe(true)
+      }
+      expect(r.links.some((l) => l.from === "c1" && l.to === "c2" && r.links.some((l2) => l2.from === "c2" && l2.to === "c1"))).toBe(false)
+    })
+  })
+
+  test("empty groups and empty item lists stay safe across all layouts", () => {
+    const emptyItems: LayoutGroup[] = [{ key: "e", label: "empty", items: [] }]
+    for (const name of LAYOUTS) {
+      const noGroups = layout(name, [], {})
+      expect(noGroups.bounds.w).toBeGreaterThan(0)
+      expect(noGroups.bounds.h).toBeGreaterThan(0)
+
+      const empty = layout(name, emptyItems, {})
+      expect(empty.labels.length).toBe(1)
+      expect(empty.labels[0].text).toBe("empty")
+      expect(Number.isFinite(empty.bounds.x) && Number.isFinite(empty.bounds.w) && empty.bounds.w > 0).toBe(true)
+    }
+  })
+
+  test("fold and satellites handle 0-session projects gracefully", () => {
+    const onlyNew = groups([0])
+    const f = layout("fold", onlyNew, {})
+    const newFold = f.cards.get("new:g0")!
+    expect(newFold.opacity).toBe(1)
+    expect(newFold.interactive).toBe(true)
+
+    const s = layout("satellites", onlyNew, {})
+    expect(s.labels.length).toBe(1)
+    expect(s.labels[0].text).toBe("project-0")
+    expect(s.cards.get("new:g0")!.opacity).toBe(0)
+    expect(s.cards.get("new:g0")!.interactive).toBe(false)
+  })
+
+  test("search custom resultLabel and no-match heading", () => {
+    const empty = layout("tree", gs, { query: () => false })
+    expect(empty.labels[0].text).toBe("No matches")
+    expect(empty.bounds.w).toBeGreaterThan(0)
+
+    const filtered = layout("tree", gs, {
+      query: (id) => id === "g0s0",
+      resultLabel: (n) => `${n} working`,
+    })
+    expect(filtered.labels[0].text).toBe("1 working")
+    expect(filtered.cards.get("new:g0")!.interactive).toBe(false)
+    expect(filtered.cards.get("new:g0")!.opacity).toBe(0)
+  })
+
+  test("formatCost formats cents and whole dollars at threshold", () => {
+    expect(formatCost(1.256)).toBe("$1.26")
+    expect(formatCost(99.99)).toBe("$99.99")
+    expect(formatCost(100)).toBe("$100")
+    expect(formatCost(142.7)).toBe("$143")
   })
 })

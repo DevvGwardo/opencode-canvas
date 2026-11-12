@@ -128,6 +128,7 @@ function shelf(blocks: Block[], aspect: number, min: number, out: LayoutResult) 
 }
 
 function columnsBlock(g: LayoutGroup, cols: number, rowMajor: boolean): Block {
+  cols = Math.max(1, cols)
   const items = g.items
   const colH = new Array(cols).fill(0)
   const pos: Array<{ id: string; c: number; y: number; h: number }> = []
@@ -149,7 +150,7 @@ function columnsBlock(g: LayoutGroup, cols: number, rowMajor: boolean): Block {
     })
   }
   const w = cols * CARD_W + (cols - 1) * GAP
-  const h = LABEL_H + Math.max(0, ...colH) - GAP
+  const h = LABEL_H + (pos.length ? Math.max(0, ...colH) - GAP : 0)
   return {
     key: g.key,
     w,
@@ -175,7 +176,7 @@ function tree(groups: LayoutGroup[], o: LayoutOptions, out: LayoutResult) {
 }
 
 function tabs(groups: LayoutGroup[], o: LayoutOptions, out: LayoutResult) {
-  const blocks = groups.map((g) => columnsBlock(g, Math.min(3, g.items.length), true))
+  const blocks = groups.map((g) => columnsBlock(g, Math.max(1, Math.min(3, g.items.length)), true))
   shelf(blocks, o.aspect ?? 1.6, 2000, out)
 }
 
@@ -184,6 +185,16 @@ const PILE_DEPTH = 4
 function pileBlock(g: LayoutGroup): Block {
   const sessions = g.items.filter((i) => i.kind === "session")
   const top = sessions[0] ?? g.items[0]
+  if (!top) {
+    return {
+      key: g.key,
+      w: CARD_W,
+      h: LABEL_H,
+      place(ox, oy, out) {
+        label(out, g.key, g.label, ox, oy, CARD_W, countLabel(g))
+      },
+    }
+  }
   const h = LABEL_H + top.h + PILE_DEPTH * 7 + 8
   return {
     key: g.key,
@@ -194,7 +205,8 @@ function pileBlock(g: LayoutGroup): Block {
       const baseY = oy + LABEL_H + PILE_DEPTH * 7
       g.items.forEach((it, i) => {
         const isNew = it.kind === "new"
-        const d = isNew ? PILE_DEPTH : Math.min(i, PILE_DEPTH)
+        const hiddenNew = isNew && sessions.length > 0
+        const d = hiddenNew ? PILE_DEPTH : Math.min(i, PILE_DEPTH)
         const sign = i % 2 ? 1 : -1
         out.cards.set(
           it.id,
@@ -202,7 +214,7 @@ function pileBlock(g: LayoutGroup): Block {
             scale: 1 - d * 0.035,
             rot: i === 0 ? 0 : sign * Math.min(d, 3) * 0.9,
             z: 100 - i,
-            opacity: isNew || i > PILE_DEPTH ? 0 : 1 - d * 0.17,
+            opacity: hiddenNew || i > PILE_DEPTH ? 0 : 1 - d * 0.17,
             // The whole pile opens as one target.
             interactive: i === 0,
           }),
@@ -214,7 +226,7 @@ function pileBlock(g: LayoutGroup): Block {
 
 function fold(groups: LayoutGroup[], o: LayoutOptions, out: LayoutResult) {
   const blocks = groups.map((g) =>
-    g.key === o.expanded ? columnsBlock(g, Math.min(3, g.items.length), true) : pileBlock(g),
+    g.key === o.expanded ? columnsBlock(g, Math.max(1, Math.min(3, g.items.length)), true) : pileBlock(g),
   )
   shelf(blocks, o.aspect ?? 1.6, 1600, out)
 }
@@ -250,6 +262,8 @@ function satellitesBlock(g: LayoutGroup): Block {
       if (hub) {
         out.cards.set(hub.id, card(cx - CARD_W / 2, cy - hub.h / 2, hub.h, { z: 50 }))
         label(out, g.key, g.label, cx - CARD_W / 2, cy - hub.h / 2 - LABEL_H, CARD_W, countLabel(g))
+      } else {
+        label(out, g.key, g.label, cx - CARD_W / 2, oy, CARD_W, countLabel(g))
       }
       rings.forEach((ring, r) => {
         const R = radii[r]
@@ -282,17 +296,37 @@ const CORNER = 8
 const ELBOW_Y = 24 // where a stacked child's connector meets its left edge
 
 function agentsBlock(g: LayoutGroup, collapsed?: Set<string>): Block {
-  const kids = new Map<string, LayoutItem[]>()
-  for (const it of g.items)
-    if (it.parent) {
-      if (!kids.has(it.parent)) kids.set(it.parent, [])
-      kids.get(it.parent)!.push(it)
+  const byId = new Map(g.items.map((i) => [i.id, i]))
+  // Only follow acyclic parent links present in this group; orphans act as roots.
+  const parentOf = new Map<string, string>()
+  for (const it of g.items) {
+    if (!it.parent || !byId.has(it.parent) || it.parent === it.id) continue
+    const seen = new Set([it.id])
+    let cur: string | undefined = it.parent
+    let cycle = false
+    while (cur && byId.has(cur)) {
+      if (seen.has(cur)) {
+        cycle = true
+        break
+      }
+      seen.add(cur)
+      cur = byId.get(cur)!.parent
     }
+    if (!cycle) parentOf.set(it.id, it.parent)
+  }
+  const kids = new Map<string, LayoutItem[]>()
+  for (const it of g.items) {
+    const p = parentOf.get(it.id)
+    if (p) {
+      if (!kids.has(p)) kids.set(p, [])
+      kids.get(p)!.push(it)
+    }
+  }
   const open = (id: string) => !collapsed?.has(id) && !!kids.get(id)?.length
-  const roots = g.items.filter((i) => !i.parent && i.kind === "session")
+  const roots = g.items.filter((i) => !parentOf.has(i.id) && i.kind === "session")
   const trees = roots.filter((r) => kids.has(r.id))
   // Sessions that never started a subagent pack into columns, like the Tree layout.
-  const loose = g.items.filter((i) => !i.parent && !kids.has(i.id))
+  const loose = g.items.filter((i) => !parentOf.has(i.id) && !kids.has(i.id))
 
   const stackSize = (it: LayoutItem): { w: number; h: number } => {
     let w = CARD_W
@@ -412,16 +446,17 @@ function agentsBlock(g: LayoutGroup, collapsed?: Set<string>): Block {
     ux += u.w + GROUP_GAP_X
     rowH = Math.max(rowH, u.h)
   }
+  const blockW = Math.max(w, CARD_W)
   const h = uy + rowH
   const agents = g.items.filter((i) => i.kind === "session")
   const cost = agents.reduce((a, i) => a + (i.cost ?? 0), 0)
   const sub = `${agents.length} agent${agents.length === 1 ? "" : "s"}${cost > 0 ? ` · ${formatCost(cost)}` : ""}`
   return {
     key: g.key,
-    w,
+    w: blockW,
     h,
     place(ox, oy, out) {
-      label(out, g.key, g.label, ox, oy, Math.max(w, CARD_W), sub)
+      label(out, g.key, g.label, ox, oy, blockW, sub)
       units.forEach((u, i) => u.place(ox + spots[i].x, oy + spots[i].y, out))
     },
   }

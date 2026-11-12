@@ -24,7 +24,86 @@ const h = <K extends keyof HTMLElementTagNameMap>(tag: K, cls = "", text?: strin
   return e
 }
 
-const looksLikePath = (q: string) => /^(~|\/|\.\.?\/)/.test(q)
+export const looksLikePath = (q: string) => /^(~([\\/]|$)|[a-zA-Z]:[\\/]|[\\/]{1,2}|\.\.?[\\/])/.test(q)
+
+export function isRootPath(p: string): boolean {
+  return p === "/" || p === "\\" || /^[a-zA-Z]:[\\/]$/.test(p)
+}
+
+export function pathSep(p: string, home?: string): "\\" | "/" {
+  if (p.includes("\\") && !p.includes("/")) return "\\"
+  if (p.includes("/")) return "/"
+  return home?.includes("\\") ? "\\" : "/"
+}
+
+function stripTrailing(p: string): string {
+  if (isRootPath(p)) return p
+  return p.replace(/[\\/]+$/, "") || p[0]
+}
+
+export function expandPath(q: string, home?: string): string {
+  if (!home) return q
+  if (q === "~") return home
+  if (q.startsWith("~/") || q.startsWith("~\\")) {
+    const cleanHome = stripTrailing(home)
+    const sep = pathSep(cleanHome)
+    const rest = q.slice(2).replace(/[\\/]/g, sep)
+    return isRootPath(cleanHome) ? cleanHome + rest : cleanHome + sep + rest
+  }
+  return q
+}
+
+export function compactPath(p: string, home?: string): string {
+  if (!home) return p
+  const cleanHome = stripTrailing(home)
+  const normP = p.replace(/\\/g, "/")
+  const normH = cleanHome.replace(/\\/g, "/")
+  const cmp = /^[a-zA-Z]:\//.test(normH) ? ([normP.toLowerCase(), normH.toLowerCase()] as const) : ([normP, normH] as const)
+  if (cmp[0] === cmp[1]) return "~"
+  const prefix = cmp[1].endsWith("/") ? cmp[1] : cmp[1] + "/"
+  if (cmp[0].startsWith(prefix)) {
+    const offset = normH.endsWith("/") ? normH.length - 1 : normH.length
+    return "~" + normP.slice(offset)
+  }
+  return p
+}
+
+export function parentDir(p: string): string {
+  const clean = stripTrailing(p)
+  if (isRootPath(clean)) return clean
+  const slash = Math.max(clean.lastIndexOf("/"), clean.lastIndexOf("\\"))
+  if (slash < 0) return "/"
+  if (slash === 0) return clean[0] === "\\" ? "\\" : "/"
+  if (/^[a-zA-Z]:[\\/]$/.test(clean.slice(0, slash + 1))) return clean.slice(0, slash + 1)
+  return clean.slice(0, slash)
+}
+
+export function joinDir(base: string, name: string, home?: string): string {
+  if (isRootPath(base)) return base + name
+  return stripTrailing(base) + pathSep(base, home) + name
+}
+
+export function splitFolderLookup(path: string, home?: string) {
+  const trailing = /[\\/]$/.test(path)
+  const exact = trailing ? stripTrailing(path) : path
+  const slash = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"))
+  let parent: string
+  if (slash < 0) parent = pathSep(path, home)
+  else if (slash === 0) parent = path[0] === "\\" ? "\\" : "/"
+  else if (/^[a-zA-Z]:[\\/]$/.test(path.slice(0, slash + 1))) parent = path.slice(0, slash + 1)
+  else parent = path.slice(0, slash)
+  const leafName = path.slice(slash + 1)
+  return {
+    trailing,
+    exact,
+    parent,
+    leafName,
+    leaf: leafName.toLowerCase(),
+    base: trailing ? exact : parent,
+    isExactRoot: isRootPath(exact),
+  }
+}
+
 const keyOf = (m?: ModelRef) => (m ? `${m.providerID}/${m.id}` : "")
 
 const ICON: Record<Option["kind"], string> = {
@@ -37,12 +116,15 @@ const ICON: Record<Option["kind"], string> = {
 
 export class NewSessionPicker {
   private el?: HTMLElement
+  private box!: HTMLElement
   private input!: HTMLInputElement
   private list!: HTMLElement
   private foot!: HTMLElement
   private modelBtn!: HTMLButtonElement
   private effort!: HTMLSelectElement
   private autoBox!: HTMLInputElement
+  private previousFocus?: HTMLElement
+  private inertBefore?: Map<HTMLElement, boolean>
   private options: Option[] = []
   private active = 0
   private seq = 0
@@ -69,6 +151,7 @@ export class NewSessionPicker {
 
   open(preferDirectory?: string) {
     if (this.el) return this.input.focus()
+    this.previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : undefined
     this.preferred = preferDirectory
     this.modelDirectory = preferDirectory
     this.model = defaultModel()
@@ -82,11 +165,15 @@ export class NewSessionPicker {
     scrim.addEventListener("pointerdown", () => this.close())
     const box = h("div", "picker")
     box.setAttribute("role", "dialog")
+    box.setAttribute("aria-modal", "true")
     box.setAttribute("aria-label", "New session")
     box.addEventListener("pointerdown", (e) => e.stopPropagation())
+    box.addEventListener("keydown", (e) => this.onDialogKey(e))
+    this.box = box
 
     const head = h("div", "picker-head")
     this.modelBtn = h("button", "picker-model-btn") as HTMLButtonElement
+    this.modelBtn.type = "button"
     this.modelBtn.title = "Choose the model (Shift+Tab)"
     this.modelBtn.addEventListener("click", () => this.setMode(this.mode === "model" ? "where" : "model"))
     this.effort = h("select", "effort-select") as HTMLSelectElement
@@ -105,16 +192,27 @@ export class NewSessionPicker {
     this.input = h("input", "picker-input") as HTMLInputElement
     this.input.spellcheck = false
     this.input.autocomplete = "off"
+    this.input.setAttribute("role", "combobox")
+    this.input.setAttribute("aria-expanded", "true")
+    this.input.setAttribute("aria-autocomplete", "list")
     this.list = h("div", "picker-list")
+    this.list.id = "picker-list"
     this.list.setAttribute("role", "listbox")
+    this.input.setAttribute("aria-controls", this.list.id)
     this.foot = h("div", "picker-foot")
     box.append(head, this.input, this.list, this.foot)
     scrim.append(box)
+    this.inertBefore = new Map()
+    for (const child of Array.from(this.host.children)) {
+      if (child instanceof HTMLElement) {
+        this.inertBefore.set(child, child.inert)
+        child.inert = true
+      }
+    }
     this.host.append(scrim)
     this.el = scrim
 
     this.input.addEventListener("input", () => void this.refresh())
-    this.input.addEventListener("keydown", (e) => this.onKey(e))
     this.setMode("where")
     void this.renderModelButton()
     requestAnimationFrame(() => this.input.focus())
@@ -122,8 +220,17 @@ export class NewSessionPicker {
 
   close() {
     this.seq++
+    if (this.inertBefore) {
+      for (const [el, was] of this.inertBefore) {
+        if (el.isConnected) el.inert = was
+      }
+      this.inertBefore = undefined
+    }
     this.el?.remove()
     this.el = undefined
+    const prev = this.previousFocus
+    this.previousFocus = undefined
+    if (prev?.isConnected) prev.focus()
   }
 
   private setMode(mode: "where" | "model") {
@@ -165,33 +272,30 @@ export class NewSessionPicker {
       sub = d ? "OpenCode default" : ""
     }
     if (btn !== this.modelBtn || selected !== this.model || directory !== this.modelDirectory || !this.el) return
-    if (this.model?.variant && option && !option.variants?.includes(this.model.variant)) {
-      this.model = { id: this.model.id, providerID: this.model.providerID }
-      setDefaultModel(this.model)
-    }
+    const variant = this.model?.variant && option?.variants?.includes(this.model.variant) ? this.model.variant : ""
     btn.append(h("span", "pm-v", name))
     if (sub) btn.append(h("span", "pm-s", sub))
     btn.append(h("span", "pm-caret", "▾"))
     effort.replaceChildren(new Option("Default effort", ""), ...(option?.variants ?? []).map((v) => new Option(effortLabel(v), v)))
-    effort.value = this.model?.variant ?? ""
+    effort.value = variant
     effort.disabled = !option?.variants?.length
     // Choosing effort for OpenCode's default makes that model explicit.
     effort.onchange = () => {
       if (!option) return
       this.model = { id: option.id, providerID: option.providerID, ...(effort.value ? { variant: effort.value } : {}) }
       setDefaultModel(this.model)
+      void this.renderModelButton()
     }
   }
 
   // ---- where -------------------------------------------------------------------
 
   private expand(q: string) {
-    if (q === "~" || q.startsWith("~/")) return (this.home ?? "") + q.slice(1)
-    return q
+    return expandPath(q, this.home)
   }
 
   private show(p: string) {
-    return this.home && p.startsWith(this.home) ? "~" + p.slice(this.home.length) : p
+    return compactPath(p, this.home)
   }
 
   private folders(dir: string) {
@@ -230,16 +334,13 @@ export class NewSessionPicker {
   private async folderOptions(raw: string, seq: number): Promise<Option[] | undefined> {
     const path = this.expand(raw)
     // List the parent, filter by the last segment.
-    const slash = path.lastIndexOf("/")
-    const parent = slash <= 0 ? "/" : path.slice(0, slash)
-    const leaf = path.slice(slash + 1).toLowerCase()
-    const exact = path.endsWith("/") ? path.replace(/\/+$/, "") || "/" : path
+    const { trailing, exact, parent, leafName, leaf, base, isExactRoot } = splitFolderLookup(path, this.home)
     const [kids, exactKids] = await Promise.all([
       this.folders(parent),
-      path.endsWith("/") ? this.folders(exact) : Promise.resolve(null),
+      trailing ? this.folders(exact) : Promise.resolve(null),
     ])
     if (seq !== this.seq) return undefined
-    const exists = path.endsWith("/") ? exactKids !== undefined || exact === "/" : !!kids?.includes(path.slice(slash + 1))
+    const exists = trailing ? exactKids !== undefined || isExactRoot : !!kids?.includes(leafName)
     const start: Option = {
       kind: "path",
       label: `Start in ${this.show(exact)}`,
@@ -247,12 +348,11 @@ export class NewSessionPicker {
       directory: exact,
     }
     const opts: Option[] = exists ? [start] : []
-    const base = path.endsWith("/") ? exact : parent
-    const names = (path.endsWith("/") ? (exactKids ?? []) : (kids ?? []).filter((k) => k.toLowerCase().startsWith(leaf) && k.toLowerCase() !== leaf))
+    const names = (trailing ? (exactKids ?? []) : (kids ?? []).filter((k) => k.toLowerCase().startsWith(leaf) && k.toLowerCase() !== leaf))
       .filter((k) => !k.startsWith(".") || leaf.startsWith("."))
       .slice(0, 40)
     for (const k of names) {
-      const dir = (base === "/" ? "" : base) + "/" + k
+      const dir = joinDir(base, k, this.home)
       opts.push({ kind: "folder", label: k, sub: this.show(dir), directory: dir })
     }
     if (!exists) opts.push(start)
@@ -324,11 +424,15 @@ export class NewSessionPicker {
     }
     this.list.replaceChildren()
     if (!this.options.length) {
+      this.input.removeAttribute("aria-activedescendant")
       this.list.append(h("div", "picker-empty", empty))
       return
     }
     this.options.forEach((o, i) => {
       const b = h("button", `picker-item ${o.kind}${i === this.active ? " active" : ""}${o.current ? " current" : ""}`) as HTMLButtonElement
+      b.type = "button"
+      b.tabIndex = -1
+      b.id = `picker-opt-${i}`
       b.setAttribute("role", "option")
       b.setAttribute("aria-selected", String(i === this.active))
       b.append(h("span", "picker-icon", ICON[o.kind]), h("span", "picker-label", o.label), h("span", "picker-sub", o.sub))
@@ -343,13 +447,15 @@ export class NewSessionPicker {
       })
       this.list.append(b)
     })
+    this.input.setAttribute("aria-activedescendant", `picker-opt-${this.active}`)
     this.list.children[this.active]?.scrollIntoView({ block: "nearest" })
   }
 
   private complete() {
     const o = this.options[this.active]
     if (!o?.directory) return
-    this.input.value = this.show(o.directory) + "/"
+    const shown = this.show(o.directory)
+    this.input.value = shown.endsWith("/") || shown.endsWith("\\") ? shown : shown + pathSep(shown)
     void this.refresh()
     this.input.focus()
   }
@@ -371,8 +477,8 @@ export class NewSessionPicker {
     const autoApprove = this.autoBox.checked
     try {
       // Make sure a typed folder exists before creating a session there.
-      if (o.kind !== "project" && o.directory !== "/") {
-        const parent = o.directory.slice(0, o.directory.lastIndexOf("/")) || "/"
+      if (o.kind !== "project" && !isRootPath(o.directory)) {
+        const parent = parentDir(o.directory)
         const siblings = await this.folders(parent)
         if (this.el !== picker) return
         if (!siblings?.includes(basename(o.directory))) {
@@ -399,13 +505,30 @@ export class NewSessionPicker {
     }
   }
 
-  private onKey(e: KeyboardEvent) {
+  private onDialogKey(e: KeyboardEvent) {
     e.stopPropagation()
     if (e.key === "Escape") {
+      if (e.defaultPrevented) return
       e.preventDefault()
       if (this.mode === "model") this.setMode("where")
       else this.close()
-    } else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      return
+    }
+    if (e.target === this.input) return this.onKey(e)
+    if (e.key === "Tab") {
+      const focusables = [...this.box.querySelectorAll<HTMLElement>("button:not(:disabled), input:not(:disabled), select:not(:disabled)")].filter(
+        (el) => el.offsetParent !== null || el === document.activeElement,
+      )
+      if (!focusables.length) return
+      const idx = focusables.indexOf(document.activeElement as HTMLElement)
+      const next = idx < 0 ? 0 : (idx + (e.shiftKey ? -1 : 1) + focusables.length) % focusables.length
+      e.preventDefault()
+      focusables[next].focus()
+    }
+  }
+
+  private onKey(e: KeyboardEvent) {
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
       e.preventDefault()
       if (!this.options.length) return
       this.active = (this.active + (e.key === "ArrowDown" ? 1 : -1) + this.options.length) % this.options.length

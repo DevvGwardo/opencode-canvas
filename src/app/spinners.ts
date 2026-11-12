@@ -9,6 +9,8 @@ const rgba = (a: number) => `rgba(${ACCENT[0]},${ACCENT[1]},${ACCENT[2]},${Math.
 
 let style: SpinnerStyle = "comet"
 const live = new Set<HTMLCanvasElement>()
+const connected = new WeakSet<HTMLCanvasElement>()
+const unmountedFrames = new WeakMap<HTMLCanvasElement, number>()
 let running = false
 
 export function setSpinnerStyle(s: SpinnerStyle) {
@@ -136,11 +138,20 @@ function loop(now: number) {
   last = now
   const t = now / 1000
   for (const c of live) {
-    if (!c.isConnected) {
-      live.delete(c)
+    if (c.isConnected) {
+      connected.add(c)
+      unmountedFrames.delete(c)
+    } else {
+      const n = (unmountedFrames.get(c) ?? 0) + 1
+      if (connected.has(c) || n > 120) {
+        live.delete(c)
+        unmountedFrames.delete(c)
+      } else {
+        unmountedFrames.set(c, n)
+      }
       continue
     }
-    if (!c.offsetParent || c.closest(".culled")) continue
+    if (!c.offsetParent || c.closest(".culled, .is-open")) continue
     const g = c.getContext("2d")
     if (!g) continue
     const s = c.width
