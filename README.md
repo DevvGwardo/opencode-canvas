@@ -386,7 +386,7 @@ bun test           # Run test suite
 bun run typecheck  # Run TypeScript type checker
 ```
 
-When inspecting the canvas in your browser developer console, `opencodeCanvas.store` and `opencodeCanvas.canvas` are available as live objects on the global scope.
+When inspecting the canvas in your browser developer console, `opencodeCanvas` exposes `store`, `canvas`, `browser`, and `loops` as live objects on the global scope.
 
 For guidelines on code structure and pull requests, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
