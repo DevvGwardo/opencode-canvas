@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test"
-import { LiveBackend } from "../src/app/backend"
+import { ApiError, LiveBackend, modelOption } from "../src/app/backend"
 
 let fetchSpy: ReturnType<typeof spyOn> | undefined
 afterEach(() => fetchSpy?.mockRestore())
@@ -31,10 +31,28 @@ describe("OpenCode backend", () => {
       data: [
         { type: "directory", path: "opencode-canvas/src/" },
         { type: "directory", path: "/code/empty/" },
+        { type: "directory", path: "C:\\Users\\you\\code\\win-app\\" },
         { type: "file", path: "opencode-canvas/README.md" },
       ],
     }))
-    expect(await new LiveBackend().listFolders("/code")).toEqual(["src", "empty"])
+    expect(await new LiveBackend().listFolders("/code")).toEqual(["src", "empty", "win-app"])
+  })
+
+  test("extracts nested API errors cleanly and strips blank model variants", async () => {
+    stubFetch(async () => Response.json({ error: { message: "bad input" } }, { status: 400, statusText: "Bad Request" }))
+    await expect(new LiveBackend().listProjects()).rejects.toThrow("bad input")
+
+    stubFetch(async () => Response.json({ message: { detail: "opaque" } }, { status: 502, statusText: "Bad Gateway" }))
+    try {
+      await new LiveBackend().listProjects()
+      throw new Error("expected throw")
+    } catch (e) {
+      expect(e).toBeInstanceOf(ApiError)
+      expect((e as Error).message).toBe("502 Bad Gateway")
+    }
+
+    expect(modelOption({ id: "m", providerID: "p", variant: "", variants: ["", "high", { id: "" }] }))
+      .toEqual({ id: "m", providerID: "p", name: "m", variants: ["high"] })
   })
 
   test("preserves native command arguments, attachments, and delivery", async () => {

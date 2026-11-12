@@ -107,3 +107,110 @@ describe("form discovery", () => {
     expect(calls).toBe(3)
   })
 })
+
+describe("store lifecycle and event edge cases", () => {
+  test("stop() during start() reload prevents poll timers from arming", async () => {
+    let resolveSessions!: (list: Session[]) => void
+    const list = new Promise<Session[]>((r) => { resolveSessions = r })
+    const { store } = setup({
+      listSessions: () => list,
+      subscribe: () => () => {},
+    })
+    const starting = store.start()
+    store.stop()
+    resolveSessions([session("a")])
+    await starting
+    expect((store as any).pollTimer).toBeUndefined()
+    expect((store as any).recentTimer).toBeUndefined()
+    expect(store.loaded).toBe(false)
+  })
+
+  test("overlapping reload keeps only the newest snapshot and preserves projects on outage", async () => {
+    let firstResolve!: (list: Session[]) => void
+    let projCalls = 0
+    let sessCalls = 0
+    const { store } = setup({
+      listProjects: async () => ++projCalls === 1
+        ? [{ id: "project", name: "Proj", canonical: "/test" }]
+        : Promise.reject(new Error("offline")),
+      listSessions: () => ++sessCalls === 1
+        ? new Promise((r) => { firstResolve = r })
+        : Promise.resolve([session("fresh")]),
+    })
+
+    store.projects.set("project", { id: "project", name: "Proj", canonical: "/test" })
+    store.activity.set("stale", "Writing…")
+    store.liveText.set("stale", "partial")
+    ;(store as any).toolNames.set("c1", { sessionID: "stale", name: "read" })
+
+    const r1 = store.reload()
+    const r2 = store.reload()
+    await r2
+    firstResolve([session("old")])
+    await r1
+
+    expect(store.projects.get("project")?.name).toBe("Proj")
+    expect([...store.sessions.keys()]).toEqual(["fresh"])
+    expect(store.activity.has("stale")).toBe(false)
+    expect(store.liveText.has("stale")).toBe(false)
+    expect((store as any).toolNames.size).toBe(0)
+  })
+
+  test("compaction end on subagent notifies ancestors and clears activity", () => {
+    const { store, emit } = setup()
+    store.addSessions([session("root"), { ...session("child"), parentID: "root" }])
+    emit("session.compaction.started", { sessionID: "child" })
+    expect(store.activity.get("child")).toBe("Compacting context…")
+    ;(store as any).dirtyCards.clear()
+    emit("session.compaction.ended", { sessionID: "child" })
+    expect(store.activity.has("child")).toBe(false)
+    expect((store as any).dirtyCards).toEqual(new Set(["child", "root"]))
+  })
+
+  test("preview marked stale mid-fetch triggers a fresh load", async () => {
+    let resolveFirst!: (page: Page<Message>) => void
+    let calls = 0
+    const { store } = setup({
+      messages: () => ++calls === 1
+        ? new Promise((r) => { resolveFirst = r })
+        : Promise.resolve({ data: [{ type: "user", id: "m2", text: "second", time: { created: 1 } }] }),
+    })
+    store.wantPreview("s")
+    // Mark stale while first fetch is still in flight.
+    ;(store as any).previewStale.add("s")
+    store.wantPreview("s")
+    resolveFirst({ data: [{ type: "user", id: "m1", text: "first", time: { created: 0 } }] })
+    await Bun.sleep(20)
+    expect(calls).toBe(2)
+    expect(store.previews.get("s")?.pendingUser).toBe("second")
+  })
+
+  test("execution lifecycle clears stale outcome, liveText, and toolNames; text.delta revives activity", () => {
+    const { store, emit } = setup()
+    store.addSessions([{ ...session("s"), outcome: "failed" }])
+    emit("session.text.delta", { sessionID: "s", delta: "hi " })
+    expect(store.running.has("s")).toBe(true)
+    expect(store.activity.get("s")).toBe("Writing…")
+    expect(store.liveText.get("s")).toBe("hi ")
+
+    emit("session.execution.started", { sessionID: "s" })
+    expect(store.sessions.get("s")?.outcome).toBeUndefined()
+    emit("session.tool.input.started", { sessionID: "s", id: "call_1", name: "read" })
+    expect((store as any).toolNames.size).toBe(1)
+    emit("session.execution.succeeded", { sessionID: "s" })
+    expect(store.liveText.has("s")).toBe(false)
+    expect((store as any).toolNames.size).toBe(0)
+    store.stop()
+  })
+
+  test("refreshRecent never resurrects a session deleted mid-fetch", async () => {
+    let resolveRecent!: (list: Session[]) => void
+    const { store, emit } = setup({ listSessions: () => new Promise((r) => { resolveRecent = r }) })
+    store.addSessions([session("s")])
+    const refresh = (store as any).refreshRecent()
+    emit("session.deleted", { sessionID: "s" })
+    resolveRecent([session("s")])
+    await refresh
+    expect(store.sessions.has("s")).toBe(false)
+  })
+})
