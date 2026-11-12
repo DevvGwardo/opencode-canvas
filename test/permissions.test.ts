@@ -149,6 +149,8 @@ describe("permissions", () => {
       className = ""
       title = ""
       textContent: string | null = ""
+      parentElement: FakeElement | null = null
+      isConnected = false
       classList = new FakeClassList()
       attrs = new Map<string, string>()
       children: FakeElement[] = []
@@ -162,21 +164,48 @@ describe("permissions", () => {
       }
       setAttribute(k: string, v: string) { this.attrs.set(k, v) }
       getAttribute(k: string) { return this.attrs.get(k) ?? null }
-      querySelector(sel: string) { return sel === ".aa-label" ? this.label ?? null : null }
+      querySelector(sel: string): FakeElement | null {
+        if (sel === ".aa-label" && this.label) return this.label
+        const cls = sel.startsWith(".") ? sel.slice(1) : sel
+        for (const c of this.children) {
+          if (c.className.split(/\s+/).includes(cls)) return c
+          const nested = c.querySelector(sel)
+          if (nested) return nested
+        }
+        return null
+      }
       addEventListener(ev: string, fn: () => void) {
         const list = this.listeners.get(ev) ?? []
         list.push(fn)
         this.listeners.set(ev, list)
       }
       click() { for (const fn of this.listeners.get("click") ?? []) fn() }
-      append(...nodes: FakeElement[]) { this.children.push(...nodes) }
-      remove() {}
+      private setConnected(on: boolean) {
+        this.isConnected = on
+        for (const c of this.children) c.setConnected(on)
+      }
+      append(...nodes: FakeElement[]) {
+        for (const n of nodes) {
+          n.parentElement = this
+          n.setConnected(this.isConnected)
+          this.children.push(n)
+        }
+      }
+      remove() {
+        if (this.parentElement) {
+          this.parentElement.children = this.parentElement.children.filter((c) => c !== this)
+          this.parentElement = null
+        }
+        this.setConnected(false)
+      }
     }
 
     const body = new FakeElement()
+    body.isConnected = true
     const fakeDoc = {
       body,
       createElement: () => new FakeElement(),
+      querySelector: (sel: string) => body.querySelector(sel),
     }
     Object.defineProperty(globalThis, "document", { configurable: true, value: fakeDoc })
     Object.defineProperty(globalThis, "requestAnimationFrame", { configurable: true, value: (cb: () => void) => { cb(); return 0 } })
@@ -222,6 +251,7 @@ describe("permissions", () => {
       expect(d2.classList.contains("on")).toBe(false)
       expect(toasts().slice(beforeDismiss)).toEqual(["Won't wait for answers: dismissed 1 waiting question"])
     } finally {
+      for (const c of [...body.children]) c.remove()
       if (realDoc) Object.defineProperty(globalThis, "document", realDoc)
       else Reflect.deleteProperty(globalThis, "document")
       if (realRaf) Object.defineProperty(globalThis, "requestAnimationFrame", realRaf)
