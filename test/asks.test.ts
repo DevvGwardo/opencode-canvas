@@ -300,4 +300,20 @@ describe("pending question synchronization", () => {
     expect(store.sessions.has("older")).toBe(true)
     expect(store.forms.get("older")).toEqual([older])
   })
+
+  test("permissions take precedence over questions anywhere in the session family", () => {
+    const { store } = setup()
+    store.forms.set("root", [{ ...form, sessionID: "root" }])
+    store.permissions.set("child", [permission])
+    expect(store.needsInput("root")).toBe("permission")
+  })
+
+  test("404 on an already empty vanished session does not allocate askVersions", async () => {
+    const { store } = setup({
+      permissions: () => Promise.reject(new ApiError(404, "Session not found")),
+      forms: () => Promise.reject(new ApiError(404, "Session not found")),
+    })
+    await store.syncAsks("missing")
+    expect((store as any).askVersions.has("missing")).toBe(false)
+  })
 })

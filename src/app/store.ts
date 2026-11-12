@@ -85,7 +85,6 @@ export class Store {
   })()
   /** Called after the canvas dismisses a question on your behalf. */
   onAutoDismissed?: (form: FormInfo) => void
-  private dismissing = new Set<string>()
   private approving = new Map<string, Promise<void>>()
   private answeringForms = new Map<string, Promise<void>>()
   private askVersions = new Map<string, number>()
@@ -93,6 +92,7 @@ export class Store {
   private deletedSessions = new Set<string>()
   private pendingAskSync?: Promise<void>
   private pendingFormDiscovery?: Promise<void>
+  private pendingForcedDiscovery = false
   /** Last session `time.updated` seen per directory, to bound form discovery. */
   private formScanUpdated = new Map<string, number>()
 
@@ -101,6 +101,8 @@ export class Store {
   private structureDirty = false
   /** Set by stop(): after teardown nothing may touch the DOM or fetch again. */
   private stopped = false
+  private runGen = 0
+  private reloadSeq = 0
   private flushScheduled = false
   private flushTimer?: ReturnType<typeof setTimeout>
   private previewQueue: string[] = []
@@ -122,10 +124,16 @@ export class Store {
   // ---- loading ------------------------------------------------------------
 
   async start() {
+    this.stop()
     this.stopped = false
+    const gen = this.runGen
     this.unsubscribe = this.backend.subscribe(
-      (ev) => this.onEvent(ev),
+      (ev) => {
+        if (this.stopped || this.runGen !== gen) return
+        this.onEvent(ev)
+      },
       (s) => {
+        if (this.stopped || this.runGen !== gen) return
         const wasReconnecting = this.connection === "reconnecting"
         this.connection = this.backend.kind === "demo" ? "demo" : s
         for (const l of this.listeners) l.connection?.(this.connection)
@@ -135,6 +143,7 @@ export class Store {
       },
     )
     await this.reload()
+    if (this.stopped || this.runGen !== gen) return
     this.pollTimer = setInterval(() => void this.syncActive(), 15_000)
     // Views from other clients (TUI, desktop) and any missed events.
     this.recentTimer = setInterval(() => void this.refreshRecent(), 45_000)
@@ -143,14 +152,16 @@ export class Store {
   private recentTimer?: ReturnType<typeof setInterval>
 
   private async refreshRecent() {
+    if (this.stopped) return
+    const gen = this.runGen
     try {
       const recent = await this.backend.listSessions(100)
+      if (this.stopped || this.runGen !== gen) return
       let structure = false
       for (const fresh of recent) {
         const cur = this.sessions.get(fresh.id)
         if (!cur) {
-          if (!fresh.time.archived) {
-            this.deletedSessions.delete(fresh.id)
+          if (!fresh.time.archived && !this.deletedSessions.has(fresh.id)) {
             this.sessions.set(fresh.id, fresh)
             structure = true
           }
@@ -166,6 +177,8 @@ export class Store {
           cur.time.idle !== fresh.time.idle ||
           cur.outcome !== fresh.outcome ||
           cur.title !== fresh.title ||
+          cur.agent !== fresh.agent ||
+          cur.cost !== fresh.cost ||
           cur.model?.id !== fresh.model?.id ||
           cur.model?.providerID !== fresh.model?.providerID ||
           cur.model?.variant !== fresh.model?.variant ||
@@ -176,8 +189,10 @@ export class Store {
           JSON.stringify(cur.permissions) !== JSON.stringify(fresh.permissions)
         if (changed) {
           if (cur.title !== fresh.title || cur.parentID !== fresh.parentID || cur.projectID !== fresh.projectID || cur.location.directory !== fresh.location.directory) structure = true
-          this.touchParent(fresh.id)
+          if (cur.time.updated !== fresh.time.updated && !this.running.has(fresh.id)) this.previewStale.add(fresh.id)
+          if (cur.parentID !== fresh.parentID) this.touchParent(fresh.id)
           this.sessions.set(fresh.id, { ...fresh, time: { ...fresh.time, viewed: Math.max(fresh.time.viewed ?? 0, cur.time.viewed ?? 0) || undefined } })
+          this.touchParent(fresh.id)
         }
       }
       if (structure) {
@@ -192,9 +207,13 @@ export class Store {
 
   stop() {
     this.stopped = true
+    this.runGen++
     this.unsubscribe?.()
+    this.unsubscribe = undefined
     if (this.pollTimer) clearInterval(this.pollTimer)
+    this.pollTimer = undefined
     if (this.recentTimer) clearInterval(this.recentTimer)
+    this.recentTimer = undefined
     if (this.flushTimer !== undefined) clearTimeout(this.flushTimer)
     this.flushTimer = undefined
     this.flushScheduled = false
@@ -204,23 +223,35 @@ export class Store {
     this.previewQueued.clear()
     for (const timer of this.refreshTimers.values()) clearTimeout(timer)
     this.refreshTimers.clear()
+    this.toolNames.clear()
   }
 
   async reload() {
+    const gen = this.runGen
+    const seq = ++this.reloadSeq
     const [projects, sessions, active] = await Promise.all([
-      this.backend.listProjects().catch(() => [] as Project[]),
+      this.backend.listProjects().catch(() => undefined),
       this.backend.listSessions(MAX_SESSIONS),
-      this.backend.active().catch(() => this.running),
+      this.backend.active().catch(() => undefined),
     ])
-    this.projects = new Map(projects.map((p) => [p.id, p]))
+    if (this.stopped || this.runGen !== gen || this.reloadSeq !== seq) return
+    if (projects !== undefined) this.projects = new Map(projects.map((p) => [p.id, p]))
     for (const s of sessions) if (s.time.archived) this.removeSession(s.id)
-    this.sessions = new Map(sessions.filter((s) => !s.time.archived).map((s) => {
+    const nextSessions = new Map(sessions.filter((s) => !s.time.archived).map((s) => {
       this.deletedSessions.delete(s.id)
       const viewed = Math.max(s.time.viewed ?? 0, this.sessions.get(s.id)?.time.viewed ?? 0)
       return [s.id, { ...s, time: { ...s.time, viewed: viewed || undefined } }]
     }))
+    const running = active ?? new Set([...this.running].filter((id) => nextSessions.has(id)))
+    for (const id of [...this.activity.keys()]) if (!running.has(id) || !nextSessions.has(id)) this.activity.delete(id)
+    for (const id of [...this.liveText.keys()]) if (!running.has(id) || !nextSessions.has(id)) this.liveText.delete(id)
+    for (const id of [...this.previews.keys()]) if (!nextSessions.has(id)) this.previews.delete(id)
+    for (const [callID, entry] of this.toolNames) {
+      if (!running.has(entry.sessionID) || !nextSessions.has(entry.sessionID)) this.toolNames.delete(callID)
+    }
+    this.sessions = nextSessions
     this.rebuildChildren()
-    this.running = active
+    this.running = running
     // Asks answered elsewhere while we were disconnected would otherwise stay
     // pending here forever, so recheck those as well as running sessions.
     void this.syncPendingAsks()
@@ -241,94 +272,131 @@ export class Store {
   }
 
   private async syncActive() {
+    if (this.stopped) return
+    const gen = this.runGen
     try {
       const active = await this.backend.active()
+      if (this.stopped || this.runGen !== gen) return
       const changed = new Set<string>()
       for (const id of active) if (!this.running.has(id)) changed.add(id)
       for (const id of this.running) if (!active.has(id)) changed.add(id)
       this.running = active
       for (const id of changed) {
-        if (!active.has(id)) this.activity.delete(id)
+        if (!active.has(id)) {
+          this.activity.delete(id)
+          this.liveText.delete(id)
+          this.clearToolNames(id)
+          if (this.sessions.has(id)) this.refreshPreviewSoon(id, 250)
+        }
         this.touchParent(id)
       }
     } catch {
       /* transient */
     }
+    if (this.stopped || this.runGen !== gen) return
     // A stable running set doesn't mean asks are unchanged. This also retries
     // failed auto-approvals and catches replies missed by the event stream.
     await this.syncPendingAsks()
   }
 
   private syncPendingAsks(): Promise<void> {
+    if (this.stopped) return Promise.resolve()
     if (this.pendingAskSync) return this.pendingAskSync
+    const gen = this.runGen
     this.pendingAskSync = (async () => {
       const ids = [...new Set([...this.running, ...this.permissions.keys(), ...this.forms.keys()])]
       // Bound background traffic when many agents are active.
-      for (let i = 0; i < ids.length; i += 4) await Promise.all(ids.slice(i, i + 4).map((id) => this.syncAsks(id)))
+      for (let i = 0; i < ids.length; i += 4) {
+        if (this.stopped || this.runGen !== gen) return
+        await Promise.all(ids.slice(i, i + 4).map((id) => this.syncAsks(id)))
+      }
     })().finally(() => { this.pendingAskSync = undefined })
     return this.pendingAskSync
   }
 
   /** Idle sessions can already have questions before this client subscribes. */
   private discoverPendingForms(force = false): Promise<void> {
-    if (this.pendingFormDiscovery) return this.pendingFormDiscovery
+    if (this.stopped) return Promise.resolve()
+    if (this.pendingFormDiscovery) {
+      if (force) this.pendingForcedDiscovery = true
+      return this.pendingFormDiscovery
+    }
+    const gen = this.runGen
     this.pendingFormDiscovery = (async () => {
-      // Rescan a directory only once per change to its sessions. Without this,
-      // every 45s refresh issues one /api/form request per project directory.
-      // reload() forces a full sweep so nothing is missed after a reconnect.
-      const updatedByDirectory = new Map<string, number>()
-      for (const s of this.sessions.values()) {
-        const d = s.location.directory
-        if (d) updatedByDirectory.set(d, Math.max(updatedByDirectory.get(d) ?? 0, s.time.updated ?? 0))
-      }
-      const directories = [...new Set([
-        ...updatedByDirectory.keys(),
-        ...[...this.projects.values()].map((p) => p.canonical),
-      ].filter(Boolean))].filter((d) => force || this.formScanUpdated.get(d) !== (updatedByDirectory.get(d) ?? 0))
-      for (let i = 0; i < directories.length; i += 4) {
-        await Promise.all(directories.slice(i, i + 4).map(async (directory) => {
-          const versions = new Map(this.askVersions)
-          let forms: FormInfo[]
-          try {
-            forms = await this.backend.pendingForms(directory)
-          } catch {
-            // Leave the directory unscanned so a transient failure is retried.
-            return
-          }
-          this.formScanUpdated.set(directory, updatedByDirectory.get(directory) ?? 0)
-          for (const form of forms) {
-            const id = form.sessionID
-            if (this.deletedSessions.has(id) || (versions.get(id) ?? 0) !== (this.askVersions.get(id) ?? 0)) continue
-            if (!this.sessions.has(id)) {
-              const session = await this.backend.getSession(id).catch(() => undefined)
-              if (!session || session.time.archived || this.deletedSessions.has(id)) continue
-              this.addSessions([session])
+      let forced = force
+      while (true) {
+        this.pendingForcedDiscovery = false
+        // Rescan a directory only once per change to its sessions. Without this,
+        // every 45s refresh issues one /api/form request per project directory.
+        // reload() forces a full sweep so nothing is missed after a reconnect.
+        const updatedByDirectory = new Map<string, number>()
+        for (const s of this.sessions.values()) {
+          const d = s.location.directory
+          if (d) updatedByDirectory.set(d, Math.max(updatedByDirectory.get(d) ?? 0, s.time.updated ?? 0))
+        }
+        const directories = [...new Set([
+          ...updatedByDirectory.keys(),
+          ...[...this.projects.values()].map((p) => p.canonical),
+        ].filter(Boolean))].filter((d) => forced || this.formScanUpdated.get(d) !== (updatedByDirectory.get(d) ?? 0))
+        for (let i = 0; i < directories.length; i += 4) {
+          if (this.stopped || this.runGen !== gen) return
+          await Promise.all(directories.slice(i, i + 4).map(async (directory) => {
+            const versions = new Map(this.askVersions)
+            let forms: FormInfo[]
+            try {
+              forms = await this.backend.pendingForms(directory)
+            } catch {
+              // Leave the directory unscanned so a transient failure is retried.
+              return
             }
-            if ((versions.get(id) ?? 0) !== (this.askVersions.get(id) ?? 0)) continue
-            const list = this.forms.get(id) ?? []
-            const next = [...list]
-            const index = next.findIndex((f) => f.id === form.id)
-            if (index < 0) next.push(form)
-            else next[index] = form
-            if (JSON.stringify(next) === JSON.stringify(list)) continue
-            // Merge only. Authoritative per-session reads clear answered forms.
-            this.forms.set(id, next)
-            this.asksChanged(id)
-            versions.set(id, this.askVersions.get(id)!)
-          }
-        }))
+            if (this.stopped || this.runGen !== gen) return
+            this.formScanUpdated.set(directory, updatedByDirectory.get(directory) ?? 0)
+            for (const form of forms) {
+              if (!form || typeof form.id !== "string" || !Array.isArray(form.fields)) continue
+              const id = form.sessionID
+              if (!id || this.deletedSessions.has(id) || (versions.get(id) ?? 0) !== (this.askVersions.get(id) ?? 0)) continue
+              if (!this.sessions.has(id)) {
+                const session = await this.backend.getSession(id).catch(() => undefined)
+                if (this.stopped || this.runGen !== gen) return
+                if (!session || session.time.archived || this.deletedSessions.has(id)) continue
+                this.addSessions([session])
+              }
+              if (this.deletedSessions.has(id) || (versions.get(id) ?? 0) !== (this.askVersions.get(id) ?? 0)) continue
+              const nextForm: FormInfo = { ...form, sessionID: id }
+              const list = this.forms.get(id) ?? []
+              const next = [...list]
+              const index = next.findIndex((f) => f.id === nextForm.id)
+              if (index < 0) next.push(nextForm)
+              else next[index] = nextForm
+              if (JSON.stringify(next) !== JSON.stringify(list)) {
+                // Merge only. Authoritative per-session reads clear answered forms.
+                this.forms.set(id, next)
+                this.asksChanged(id)
+                versions.set(id, this.askVersions.get(id)!)
+              }
+              this.maybeAutoDismiss(nextForm)
+            }
+          }))
+        }
+        if (!this.pendingForcedDiscovery || this.stopped || this.runGen !== gen) break
+        forced = true
       }
-    })().finally(() => { this.pendingFormDiscovery = undefined })
+    })().finally(() => {
+      this.pendingForcedDiscovery = false
+      this.pendingFormDiscovery = undefined
+    })
     return this.pendingFormDiscovery
   }
 
   /** Coalesce readers and never replace newer events with an older snapshot. */
   syncAsks(id: string): Promise<void> {
-    if (this.deletedSessions.has(id)) return Promise.resolve()
+    if (this.stopped || this.deletedSessions.has(id)) return Promise.resolve()
     const current = this.askSyncs.get(id)
     if (current) return current
+    const gen = this.runGen
     const sync = (async () => {
       while (true) {
+        if (this.stopped || this.runGen !== gen || this.deletedSessions.has(id)) return
         const version = this.askVersions.get(id) ?? 0
         let gone = 0
         const ask = <T>(p: Promise<T[]>): Promise<T[] | undefined> =>
@@ -337,15 +405,16 @@ export class Store {
             return undefined
           })
         const [perms, forms] = await Promise.all([ask(this.backend.permissions(id)), ask(this.backend.forms(id))])
-        if (this.deletedSessions.has(id)) return
+        if (this.stopped || this.runGen !== gen || this.deletedSessions.has(id)) return
         if (version !== (this.askVersions.get(id) ?? 0)) continue
         // Both session-scoped endpoints 404 only when the session itself is
         // gone. Drop its asks: a vanished session must not keep the "Allow
         // all" chip up or re-poll the server every 15s forever.
         if (gone === 2) {
+          const had = this.permissions.has(id) || this.forms.has(id)
           this.setList(this.permissions, id, [])
           this.setList(this.forms, id, [])
-          this.asksChanged(id)
+          if (had) this.asksChanged(id)
           return
         }
         const changed = perms !== undefined && JSON.stringify(perms) !== JSON.stringify(this.permissions.get(id) ?? [])
@@ -369,27 +438,32 @@ export class Store {
     this.touchParent(id)
   }
 
-  replyForm(form: FormInfo, answer: Record<string, unknown>) {
-    return this.resolveForm(form, () => this.backend.replyForm(form.sessionID, form.id, answer))
+  async replyForm(form: FormInfo, answer: Record<string, unknown>): Promise<void> {
+    await this.resolveForm(form, () => this.backend.replyForm(form.sessionID, form.id, answer))
   }
 
-  cancelForm(form: FormInfo) {
-    return this.resolveForm(form, () => this.backend.cancelForm(form.sessionID, form.id))
+  async cancelForm(form: FormInfo): Promise<void> {
+    await this.resolveForm(form, () => this.backend.cancelForm(form.sessionID, form.id))
   }
 
-  private resolveForm(form: FormInfo, fn: () => Promise<void>): Promise<void> {
+  private async resolveForm(form: FormInfo, fn: () => Promise<void>): Promise<boolean> {
     const key = `${form.sessionID}/${form.id}`
     const current = this.answeringForms.get(key)
-    if (current) return current
+    if (current) {
+      await current
+      return false
+    }
     const reply = (async () => {
       await fn()
       this.clearForm(form.sessionID, form.id)
     })().finally(() => { this.answeringForms.delete(key) })
     this.answeringForms.set(key, reply)
-    return reply
+    await reply
+    return true
   }
 
   private clearForm(id: string, formID: string) {
+    if (this.deletedSessions.has(id)) return
     this.setList(this.forms, id, (this.forms.get(id) ?? []).filter((f) => f.id !== formID))
     this.asksChanged(id)
   }
@@ -401,33 +475,29 @@ export class Store {
   }
 
   /** Dismiss a question form and drop it from the pending list. */
-  async dismissForm(form: FormInfo, auto = false) {
-    if (this.dismissing.has(form.id)) return
-    this.dismissing.add(form.id)
-    try {
-      await this.backend.cancelForm(form.sessionID, form.id)
-      this.clearForm(form.sessionID, form.id)
-      if (auto) this.onAutoDismissed?.(form)
-    } finally {
-      this.dismissing.delete(form.id)
-    }
+  async dismissForm(form: FormInfo, auto = false): Promise<boolean> {
+    const dismissed = await this.resolveForm(form, () => this.backend.cancelForm(form.sessionID, form.id))
+    if (auto && dismissed) this.onAutoDismissed?.(form)
+    return dismissed
   }
 
   async dismissAllPendingForms(sessionID?: string): Promise<number> {
-    const forms = sessionID ? [...(this.forms.get(sessionID) ?? [])] : [...this.forms.values()].flat()
+    const forms = sessionID
+      ? [...this.family(sessionID)].flatMap((id) => this.forms.get(id) ?? [])
+      : [...this.forms.values()].flat()
     const results = await Promise.allSettled(forms.map((f) => this.dismissForm(f)))
-    return results.filter((r) => r.status === "fulfilled").length
+    return results.filter((r) => r.status === "fulfilled" && r.value).length
   }
 
-  setAutoDismissQuestions(on: boolean) {
+  setAutoDismissQuestions(on: boolean): Promise<number> {
     this.autoDismissQuestions = on
     try {
       localStorage.setItem(DISMISS_QUESTIONS_KEY, on ? "1" : "0")
     } catch {
       /* private mode */
     }
-    if (on) void this.dismissAllPendingForms()
     for (const id of this.forms.keys()) this.touchParent(id)
+    return on ? this.dismissAllPendingForms() : Promise.resolve(0)
   }
 
   private maybeAutoDismiss(form: FormInfo) {
@@ -502,11 +572,12 @@ export class Store {
   }
 
   needsInput(id: string): "permission" | "question" | undefined {
+    let question = false
     for (const c of this.family(id)) {
       if (this.permissions.get(c)?.length) return "permission"
-      if (this.forms.get(c)?.length) return "question"
+      if (this.forms.get(c)?.length) question = true
     }
-    return undefined
+    return question ? "question" : undefined
   }
 
   pendingInputSessions(id: string): string[] {
@@ -614,8 +685,10 @@ export class Store {
     }
     const reply = (async () => {
       await this.backend.replyPermission(req.sessionID, req.id, decision)
-      this.setList(this.permissions, req.sessionID, (this.permissions.get(req.sessionID) ?? []).filter((p) => p.id !== req.id))
-      this.asksChanged(req.sessionID)
+      if (!this.deletedSessions.has(req.sessionID)) {
+        this.setList(this.permissions, req.sessionID, (this.permissions.get(req.sessionID) ?? []).filter((p) => p.id !== req.id))
+        this.asksChanged(req.sessionID)
+      }
     })().finally(() => { this.approving.delete(key) })
     this.approving.set(key, reply)
     await reply
@@ -630,15 +703,15 @@ export class Store {
     return results.filter((r) => r.status === "fulfilled" && r.value).length
   }
 
-  setAutoApproveAll(on: boolean) {
+  setAutoApproveAll(on: boolean): Promise<number> {
     this.autoApproveAll = on
     try {
       localStorage.setItem(AUTO_KEY, on ? "1" : "0")
     } catch {
       /* private mode */
     }
-    if (on) void this.approveAllPending()
     for (const id of this.permissions.keys()) this.touchParent(id)
+    return on ? this.approveAllPending() : Promise.resolve(0)
   }
 
   /** Add or remove the allow-everything rule on the server for one session. */
@@ -651,7 +724,8 @@ export class Store {
     const rest = (s.permissions ?? []).filter((r) => !isAllowAll(r))
     const rules = on ? [...rest, ALLOW_ALL] : rest
     await this.backend.setSessionPermissions(id, rules.length ? rules : null)
-    s.permissions = rules.length ? rules : null
+    const cur = this.sessions.get(id)
+    if (cur) cur.permissions = rules.length ? rules : null
     this.touchParent(id)
     if (on) await this.approveAllPending(id)
   }
@@ -679,7 +753,7 @@ export class Store {
 
   /** Ask for a card's preview; cheap to call every frame for visible cards. */
   wantPreview(id: string) {
-    if (this.stopped) return
+    if (this.stopped || this.deletedSessions.has(id)) return
     if (this.previews.has(id) && !this.previewStale.has(id)) return
     if ((this.previewRetry.get(id) ?? 0) > Date.now()) return
     if (this.previewQueued.has(id)) return
@@ -689,7 +763,7 @@ export class Store {
   }
 
   private pumpPreviews() {
-    while (this.previewInflight < PREVIEW_CONCURRENCY && this.previewQueue.length) {
+    while (!this.stopped && this.previewInflight < PREVIEW_CONCURRENCY && this.previewQueue.length) {
       // Newest requests first: those are the cards on screen right now.
       const id = this.previewQueue.pop()!
       // A session deleted while its preview waited needs no fetch.
@@ -701,32 +775,38 @@ export class Store {
       this.loadPreview(id).finally(() => {
         this.previewInflight--
         this.previewQueued.delete(id)
-        this.pumpPreviews()
+        if (this.stopped) return
+        if (!this.deletedSessions.has(id) && this.previewStale.has(id) && !this.previewRetry.has(id)) {
+          this.wantPreview(id)
+        } else {
+          this.pumpPreviews()
+        }
       })
     }
   }
 
   private async loadPreview(id: string) {
+    this.previewStale.delete(id)
     try {
       const page = await this.backend.messages(id, 16)
-      if (this.deletedSessions.has(id)) return
+      if (this.stopped || this.deletedSessions.has(id)) return
       this.previewRetry.delete(id)
-      this.previewStale.delete(id)
       this.previews.set(id, buildPreview(page.data))
       this.touchCard(id)
     } catch {
-      if (this.deletedSessions.has(id)) return
+      if (this.stopped || this.deletedSessions.has(id)) return
       this.previewStale.add(id)
       this.previewRetry.set(id, Date.now() + 5_000)
     }
   }
 
   private refreshPreviewSoon(id: string, delay = 900) {
-    if (this.refreshTimers.has(id)) return
+    if (this.stopped || this.refreshTimers.has(id)) return
     this.refreshTimers.set(
       id,
       setTimeout(() => {
         this.refreshTimers.delete(id)
+        if (this.stopped || this.deletedSessions.has(id)) return
         this.previewStale.add(id)
         this.wantPreview(id)
       }, delay),
@@ -740,9 +820,11 @@ export class Store {
     const id: string | undefined = d.sessionID
     switch (ev.type) {
       case "session.created": {
-        this.deletedSessions.delete(d.sessionID)
+        if (!id) break
+        this.deletedSessions.delete(id)
+        const gen = this.runGen
         const s: Session = {
-          id: d.sessionID,
+          id,
           parentID: d.parentID,
           projectID: d.projectID,
           agent: d.agent,
@@ -763,10 +845,19 @@ export class Store {
         this.backend
           .getSession(s.id)
           .then((full) => {
-            if (!this.sessions.has(s.id)) return
-            this.sessions.set(s.id, full)
+            if (this.stopped || this.runGen !== gen || !this.sessions.has(s.id)) return
+            if (full.time.archived) {
+              this.removeSession(s.id)
+              this.rebuildChildren()
+              this.markStructure()
+              return
+            }
+            const cur = this.sessions.get(s.id)
+            const viewed = Math.max(full.time.viewed ?? 0, cur?.time.viewed ?? 0)
+            this.sessions.set(s.id, { ...full, time: { ...full.time, viewed: viewed || undefined } })
             this.rebuildChildren()
             this.markStructure()
+            this.touchParent(s.id)
           })
           .catch(() => {})
         this.markStructure()
@@ -784,23 +875,37 @@ export class Store {
         break
       case "session.moved":
       case "session.forked":
-        if (id)
+        if (id) {
+          const gen = this.runGen
           this.backend
             .getSession(id)
             .then((s) => {
-              if (!this.sessions.has(id)) return
-              this.sessions.set(id, s)
+              if (this.stopped || this.runGen !== gen || !this.sessions.has(id)) return
+              if (s.time.archived) {
+                this.removeSession(id)
+                this.rebuildChildren()
+                this.markStructure()
+                return
+              }
+              const cur = this.sessions.get(id)
+              const viewed = Math.max(s.time.viewed ?? 0, cur?.time.viewed ?? 0)
+              this.sessions.set(id, { ...s, time: { ...s.time, viewed: viewed || undefined } })
               this.rebuildChildren()
               this.markStructure()
+              this.touchParent(id)
             })
             .catch(() => {})
+        }
         break
       case "session.execution.started":
         if (!id) break
         this.running.add(id)
         this.activity.set(id, "Working…")
         this.liveText.delete(id)
-        this.patch(id, (s) => (s.time.updated = ev.created ?? Date.now()), false)
+        this.patch(id, (s) => {
+          s.outcome = undefined
+          s.time.updated = ev.created ?? Date.now()
+        }, false)
         this.markStructure()
         break
       case "session.execution.succeeded":
@@ -809,6 +914,8 @@ export class Store {
         if (!id) break
         this.running.delete(id)
         this.activity.delete(id)
+        this.liveText.delete(id)
+        this.clearToolNames(id)
         this.patch(
           id,
           (s) => {
@@ -829,6 +936,7 @@ export class Store {
         break
       case "session.text.delta":
         if (!id) break
+        if (!this.running.has(id)) this.setActivity(id, "Writing…")
         this.liveText.set(id, ((this.liveText.get(id) ?? "") + (d.delta ?? "")).slice(-600))
         this.touchParent(id)
         break
@@ -837,14 +945,14 @@ export class Store {
         break
       case "session.tool.input.started":
         this.setActivity(id, describeTool(d.name ?? "tool"))
-        if (id) this.toolNames.set(d.id, d.name)
+        if (id && d.id && d.name) this.toolNames.set(d.id, { sessionID: id, name: d.name })
         break
       case "session.tool.called":
-        this.setActivity(id, describeTool(this.toolNames.get(d.id) ?? "tool", d.input))
+        this.setActivity(id, describeTool((d.id ? this.toolNames.get(d.id)?.name : undefined) ?? d.name ?? "tool", d.input))
         break
       case "session.tool.success":
       case "session.tool.failed":
-        this.toolNames.delete(d.id)
+        if (d.id) this.toolNames.delete(d.id)
         this.setActivity(id, "Working…")
         break
       case "session.compaction.started":
@@ -855,7 +963,7 @@ export class Store {
         // The compaction is over (either way); stop saying we're compacting.
         if (id && this.activity.get(id) === "Compacting context…") {
           this.activity.delete(id)
-          this.touchCard(id)
+          this.touchParent(id)
         }
         break
       case "session.retry.scheduled":
@@ -913,9 +1021,13 @@ export class Store {
         if (ask) {
           const form = d.form ?? d
           if (typeof form.id === "string" && Array.isArray(form.fields)) {
-            this.forms.set(ask, [...(this.forms.get(ask) ?? []).filter((f) => f.id !== form.id), { ...form, sessionID: ask }])
+            const next: FormInfo = { ...form, sessionID: ask }
+            this.forms.set(ask, [...(this.forms.get(ask) ?? []).filter((f) => f.id !== form.id), next])
+            this.asksChanged(ask)
+            this.maybeAutoDismiss(next)
+          } else {
+            this.asksChanged(ask)
           }
-          this.asksChanged(ask)
           void this.syncAsks(ask)
         }
         break
@@ -928,7 +1040,7 @@ export class Store {
         // on the event itself; the others carry it directly.
         const ask = d.sessionID ?? d.form?.sessionID
         if (ask) {
-          this.clearForm(ask, d.formID ?? d.requestID ?? d.id)
+          this.clearForm(ask, d.formID ?? d.requestID ?? d.id ?? d.form?.id)
           void this.syncAsks(ask)
         }
         break
@@ -937,7 +1049,13 @@ export class Store {
     for (const l of this.listeners) l.event?.(ev)
   }
 
-  private toolNames = new Map<string, string>()
+  private toolNames = new Map<string, { sessionID: string; name: string }>()
+
+  private clearToolNames(sessionID: string) {
+    for (const [callID, entry] of this.toolNames) {
+      if (entry.sessionID === sessionID) this.toolNames.delete(callID)
+    }
+  }
 
   private setActivity(id: string | undefined, label: string) {
     if (!id) return
@@ -969,6 +1087,7 @@ export class Store {
     this.forms.delete(id)
     this.previewStale.delete(id)
     this.previewRetry.delete(id)
+    this.clearToolNames(id)
     clearTimeout(this.refreshTimers.get(id))
     this.refreshTimers.delete(id)
     this.asksChanged(id)
@@ -1032,7 +1151,7 @@ export function buildPreview(desc: Message[]): Preview {
   for (const m of desc) {
     if (m.type === "assistant") {
       answered = true
-      const text = lastAssistantText(m.content)
+      const text = lastAssistantText(m.content ?? [])
       if (text) return { ...previewBlocks(text), pendingUser }
     } else if (m.type === "user" && !answered && pendingUser === undefined) {
       pendingUser = m.text

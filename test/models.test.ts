@@ -76,6 +76,35 @@ describe("model choices", () => {
     expect((await models(backend))[0].id).toBe("m")
   })
 
+  test("slow rejected models call cannot evict a newer cached snapshot", async () => {
+    let rejectFirst!: (err: Error) => void
+    let call = 0
+    const backend = {
+      listModels: () => {
+        call++
+        if (call === 1) return new Promise((_, rej) => { rejectFirst = rej })
+        return Promise.resolve([{ id: "fresh", providerID: "p", name: "Fresh" }])
+      },
+    } as Backend
+    const realNow = Date.now
+    let now = 1_000_000
+    Date.now = () => now
+    try {
+      const first = models(backend, "/race")
+      now += 61_000
+      const second = await models(backend, "/race")
+      expect(second[0].id).toBe("fresh")
+      rejectFirst(new Error("stale failure"))
+      await expect(first).rejects.toThrow("stale failure")
+      now += 1_000
+      const third = await models(backend, "/race")
+      expect(third[0].id).toBe("fresh")
+      expect(call).toBe(2)
+    } finally {
+      Date.now = realNow
+    }
+  })
+
   test("switches effort only after the server accepts it", async () => {
     storage()
     const session = { id: "ses_test", location: { directory: "/project" }, model: { id: "m", providerID: "p" } } as Session

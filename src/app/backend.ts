@@ -16,6 +16,7 @@ import type {
   Project,
   Session,
 } from "./types"
+import { basename } from "./format"
 
 export type ConnectionState = "connecting" | "live" | "reconnecting" | "demo"
 
@@ -105,8 +106,14 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
     json = text
   }
   if (!res.ok) {
-    const msg = (json && typeof json === "object" && (json.message || json._tag)) || `${res.status} ${res.statusText}`
-    throw new ApiError(res.status, String(msg), json)
+    const errObj = json && typeof json === "object" ? json : undefined
+    const msg =
+      (typeof errObj?.message === "string" && errObj.message) ||
+      (typeof errObj?.error?.message === "string" && errObj.error.message) ||
+      (typeof errObj?.error === "string" && errObj.error) ||
+      (typeof errObj?._tag === "string" && errObj._tag) ||
+      `${res.status} ${res.statusText}`
+    throw new ApiError(res.status, msg, json)
   }
   return json as T
 }
@@ -151,8 +158,8 @@ export class LiveBackend implements Backend {
   }
 
   async active() {
-    const r = await request<{ data: Record<string, { type: string }> }>("GET", "/api/session/active")
-    return new Set(Object.entries(r.data ?? {}).filter(([, v]) => v?.type === "running").map(([k]) => k))
+    const r = unwrap(await request<{ data: Record<string, { type: string }> } | Record<string, { type: string }>>("GET", "/api/session/active")) ?? {}
+    return new Set(Object.entries(r).filter(([, v]) => v?.type === "running").map(([k]) => k))
   }
 
   async messages(id: string, limit: number, cursor?: string) {
@@ -191,8 +198,7 @@ export class LiveBackend implements Backend {
   }
 
   async serverDefaultModel(directory?: string) {
-    const r = await request<{ data: any }>("GET", "/api/model/default" + locationQuery(directory))
-    const m = r?.data
+    const m = unwrap(await request<{ data: any } | any>("GET", "/api/model/default" + locationQuery(directory)))
     return m?.id ? modelOption(m) : undefined
   }
 
@@ -209,10 +215,14 @@ export class LiveBackend implements Backend {
   }
 
   async listFolders(path: string) {
-    const r = await request<{ data: Array<{ path: string; type: string }> }>("GET", `/api/fs/list?path=${enc(path)}`)
-    return (r.data ?? [])
+    const r = await request<{ data: Array<{ path: string; type: string }> } | Array<{ path: string; type: string }>>(
+      "GET",
+      `/api/fs/list?path=${enc(path)}`,
+    )
+    return (unwrap(r) ?? [])
       .filter((e) => e.type === "directory")
-      .map((e) => e.path.replace(/\/+$/, "").split("/").pop()!)
+      .map((e) => basename(e.path))
+      .filter(Boolean)
   }
 
   async switchModel(id: string, model: ModelRef) {
@@ -269,6 +279,10 @@ export class LiveBackend implements Backend {
     let timer: ReturnType<typeof setTimeout> | undefined
 
     const connect = () => {
+      if (timer) {
+        clearTimeout(timer)
+        timer = undefined
+      }
       if (closed) return
       es = new EventSource("/api/event")
       es.onopen = () => {
@@ -290,6 +304,7 @@ export class LiveBackend implements Backend {
         es?.close()
         if (closed) return
         onState("reconnecting")
+        if (timer) clearTimeout(timer)
         timer = setTimeout(connect, retry)
         retry = Math.min(retry * 2, 10_000)
       }
@@ -313,13 +328,15 @@ export function attachmentSrc(f: FileAttachment): string | undefined {
 
 export function modelOption(m: any): ModelOption {
   const variants = Array.isArray(m.variants)
-    ? m.variants.map((v: any) => typeof v === "string" ? v : v?.id).filter((v: unknown): v is string => typeof v === "string")
+    ? m.variants
+        .map((v: any) => (typeof v === "string" ? v : v?.id))
+        .filter((v: unknown): v is string => typeof v === "string" && v.length > 0)
     : []
   return {
     id: String(m.id),
     providerID: String(m.providerID),
     name: String(m.name ?? m.id),
-    ...(typeof m.variant === "string" ? { variant: m.variant } : {}),
+    ...(typeof m.variant === "string" && m.variant ? { variant: m.variant } : {}),
     variants: [...new Set<string>(variants)],
   }
 }

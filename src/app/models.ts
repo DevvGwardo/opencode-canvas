@@ -53,10 +53,10 @@ export function models(backend: Backend, directory?: string): Promise<ModelOptio
   if (cached && cached.expires > Date.now()) return cached.value
   const value = backend.listModels(directory).then((all) => {
     // OpenCode can briefly return an empty snapshot while plugins settle.
-    if (!all.length) entries!.delete(key)
+    if (!all.length && entries!.get(key)?.value === value) entries!.delete(key)
     return all
   }).catch((e) => {
-    entries!.delete(key)
+    if (entries!.get(key)?.value === value) entries!.delete(key)
     throw e
   })
   entries.set(key, { value, expires: Date.now() + 60_000 })

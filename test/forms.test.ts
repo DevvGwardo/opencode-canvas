@@ -92,6 +92,8 @@ describe("question answers", () => {
       expect(() => formAnswer([field], { v: bad })).toThrow("invalid answer")
     }
     expect(formAnswer([{ key: "v", type: "string", format: "email" }], { v: "user@localhost" })).toEqual({ v: "user@localhost" })
+    expect(formAnswer([{ key: "v", type: "string", format: "date-time" }], { v: "2026-10-09t12:00:00z" })).toEqual({ v: "2026-10-09t12:00:00z" })
     expect(() => formAnswer([{ key: "v", type: "string", format: "date-time" }], { v: "2024-02-30T12:00:00Z" })).toThrow("invalid answer")
+    expect(() => formAnswer([{ key: "v", type: "string", format: "date-time" }], { v: "2026-10-09T24:00:00Z" })).toThrow("invalid answer")
   })
 })

@@ -2,6 +2,7 @@
 // real server. Used by --demo / ?demo, and handy for working on the UI.
 
 import type { Backend, CommandInput, ConnectionState, PromptInput } from "./backend"
+import { basename } from "./format"
 import type {
   Delivery,
   FormInfo,
@@ -145,6 +146,9 @@ export class DemoBackend implements Backend {
   private inboxes = new Map<string, InboxItem[]>()
   private perms = new Map<string, PermissionRequest[]>()
   private running = new Set<string>()
+  private loopRunning = new Set<string>()
+  private runTokens = new Map<string, number>()
+  private interrupts = new Map<string, number>()
   private subs = new Set<(ev: OcEvent) => void>()
   private projects: Project[] = PROJECTS.map(([id, name]) => ({ id, name, canonical: `/Users/you/code/${name}` }))
 
@@ -210,7 +214,9 @@ export class DemoBackend implements Backend {
           this.inboxes.set(id, [{ id: uid("msg"), sessionID: id, type: "user", payload: { text: seed.user }, delivery: "queue", time: { created: now } }])
         }
         const finishes = seed.title === "Nightly export to the warehouse"
-        setTimeout(() => this.loop(id, !finishes), 400 + Math.random() * 2500)
+        setTimeout(() => {
+          if (this.running.has(id)) void this.loop(id, !finishes)
+        }, 400 + Math.random() * 2500)
       }
     }
     // One session blocked on a permission prompt.
@@ -251,7 +257,9 @@ export class DemoBackend implements Backend {
       this.addTeam(s, m.team ?? [], created)
       if (m.running) {
         this.running.add(id)
-        setTimeout(() => this.loop(id, true), 600 + Math.random() * 2500)
+        setTimeout(() => {
+          if (this.running.has(id)) void this.loop(id, true)
+        }, 600 + Math.random() * 2500)
       }
     })
   }
@@ -265,11 +273,17 @@ export class DemoBackend implements Backend {
 
   subscribe(onEvent: (ev: OcEvent) => void, onState: (s: ConnectionState) => void) {
     this.subs.add(onEvent)
-    setTimeout(() => {
+    let closed = false
+    const timer = setTimeout(() => {
+      if (closed) return
       onState("demo")
       onEvent({ id: uid("evt"), type: "server.connected", data: {} })
     }, 0)
-    return () => this.subs.delete(onEvent)
+    return () => {
+      closed = true
+      clearTimeout(timer)
+      this.subs.delete(onEvent)
+    }
   }
 
   // ---- simulated work ----
@@ -278,89 +292,104 @@ export class DemoBackend implements Backend {
     return new Promise((r) => setTimeout(r, ms))
   }
 
+  private nextToken(id: string): number {
+    const token = (this.runTokens.get(id) ?? 0) + 1
+    this.runTokens.set(id, token)
+    return token
+  }
+
   private async loop(id: string, forever: boolean, replyTo?: string) {
     const s = this.sessions.get(id)
     if (!s) return
+    const token = this.nextToken(id)
+    const isActive = () => this.running.has(id) && this.runTokens.get(id) === token
     this.running.add(id)
+    this.loopRunning.add(id)
+    s.outcome = undefined
+    if (!this.msgs.has(id)) this.msgs.set(id, [])
     this.emit("session.execution.started", { sessionID: id })
     let rounds = 0
-    while (this.running.has(id)) {
-      const m: Assistant = {
-        type: "assistant",
-        id: uid("msg"),
-        time: { created: Date.now() },
-        agent: "build",
-        model: s.model!,
-        content: [],
-      }
-      this.msgs.get(id)!.push(m)
-      const aid = m.id
-      this.emit("session.step.started", { sessionID: id, assistantMessageID: aid, agent: "build", model: s.model })
+    try {
+      while (isActive()) {
+        const m: Assistant = {
+          type: "assistant",
+          id: uid("msg"),
+          time: { created: Date.now() },
+          agent: "build",
+          model: s.model!,
+          content: [],
+        }
+        this.msgs.get(id)!.push(m)
+        const aid = m.id
+        this.emit("session.step.started", { sessionID: id, assistantMessageID: aid, agent: "build", model: s.model })
 
-      this.emit("session.reasoning.started", { sessionID: id, assistantMessageID: aid, ordinal: 0 })
-      m.content.push({ type: "reasoning", text: "", time: { created: Date.now() } })
-      await this.sleep(900 + Math.random() * 900)
-      ;(m.content[0] as any).time.completed = Date.now()
-      this.emit("session.reasoning.ended", { sessionID: id, assistantMessageID: aid, ordinal: 0 })
+        this.emit("session.reasoning.started", { sessionID: id, assistantMessageID: aid, ordinal: 0 })
+        m.content.push({ type: "reasoning", text: "", time: { created: Date.now() } })
+        await this.sleep(900 + Math.random() * 900)
+        if (!isActive()) break
+        ;(m.content[0] as any).time.completed = Date.now()
+        this.emit("session.reasoning.ended", { sessionID: id, assistantMessageID: aid, ordinal: 0 })
 
-      const tools = 1 + Math.floor(Math.random() * 3)
-      for (let i = 0; i < tools && this.running.has(id); i++) {
-        const st = SCRIPT[Math.floor(Math.random() * SCRIPT.length)]
-        const call = uid("call")
-        const part = { type: "tool" as const, id: call, name: st.tool, state: { status: "streaming" } as any, time: { created: Date.now() } }
-        m.content.push(part)
-        this.emit("session.tool.input.started", { sessionID: id, assistantMessageID: aid, id: call, name: st.tool })
-        await this.sleep(250)
-        part.state = { status: "running", input: st.input, metadata: {} }
-        this.emit("session.tool.called", { sessionID: id, assistantMessageID: aid, id: call, input: st.input, executed: false })
-        await this.sleep(900 + Math.random() * 1800)
-        part.state = { status: "completed", input: st.input, content: [{ type: "text", text: st.output }] } as any
-        this.emit("session.tool.success", { sessionID: id, assistantMessageID: aid, id: call, content: [{ type: "text", text: st.output }], executed: true })
-      }
-      if (!this.running.has(id)) break
+        const tools = 1 + Math.floor(Math.random() * 3)
+        for (let i = 0; i < tools && isActive(); i++) {
+          const st = SCRIPT[Math.floor(Math.random() * SCRIPT.length)]
+          const call = uid("call")
+          const part = { type: "tool" as const, id: call, name: st.tool, state: { status: "streaming" } as any, time: { created: Date.now() } }
+          m.content.push(part)
+          this.emit("session.tool.input.started", { sessionID: id, assistantMessageID: aid, id: call, name: st.tool })
+          await this.sleep(250)
+          if (!isActive()) break
+          part.state = { status: "running", input: st.input, metadata: {} }
+          this.emit("session.tool.called", { sessionID: id, assistantMessageID: aid, id: call, input: st.input, executed: false })
+          await this.sleep(900 + Math.random() * 1800)
+          if (!isActive()) break
+          part.state = { status: "completed", input: st.input, content: [{ type: "text", text: st.output }] } as any
+          this.emit("session.tool.success", { sessionID: id, assistantMessageID: aid, id: call, content: [{ type: "text", text: st.output }], executed: true })
+        }
+        if (!isActive()) break
 
-      const reply = replyTo
-        ? `On “${replyTo.slice(0, 60)}”: ${REPLIES[Math.floor(Math.random() * REPLIES.length)]}`
-        : REPLIES[Math.floor(Math.random() * REPLIES.length)]
-      replyTo = undefined
-      const textPart = { type: "text" as const, text: "" }
-      m.content.push(textPart)
-      this.emit("session.text.started", { sessionID: id, assistantMessageID: aid, ordinal: 0 })
-      for (const word of reply.split(/(?<= )/)) {
-        if (!this.running.has(id)) break
-        textPart.text += word
-        this.emit("session.text.delta", { sessionID: id, assistantMessageID: aid, ordinal: 0, delta: word })
-        await this.sleep(28 + Math.random() * 50)
-      }
-      this.emit("session.text.ended", { sessionID: id, assistantMessageID: aid, ordinal: 0 })
-      m.time.completed = Date.now()
-      m.finish = "stop"
-      s.time.updated = Date.now()
-      this.emit("session.step.ended", { sessionID: id, assistantMessageID: aid, finish: "stop" })
-      rounds++
+        const reply = replyTo
+          ? `On “${replyTo.slice(0, 60)}”: ${REPLIES[Math.floor(Math.random() * REPLIES.length)]}`
+          : REPLIES[Math.floor(Math.random() * REPLIES.length)]
+        replyTo = undefined
+        const textPart = { type: "text" as const, text: "" }
+        m.content.push(textPart)
+        this.emit("session.text.started", { sessionID: id, assistantMessageID: aid, ordinal: 0 })
+        for (const word of reply.split(/(?<= )/)) {
+          if (!isActive()) break
+          textPart.text += word
+          this.emit("session.text.delta", { sessionID: id, assistantMessageID: aid, ordinal: 0, delta: word })
+          await this.sleep(28 + Math.random() * 50)
+        }
+        if (!isActive()) break
+        this.emit("session.text.ended", { sessionID: id, assistantMessageID: aid, ordinal: 0 })
+        m.time.completed = Date.now()
+        m.finish = "stop"
+        s.time.updated = Date.now()
+        this.emit("session.step.ended", { sessionID: id, assistantMessageID: aid, finish: "stop" })
+        rounds++
 
-      // Deliver a queued message, if any, as the next turn.
-      const queued = this.inboxes.get(id)?.shift()
-      if (queued) {
-        this.msgs.get(id)!.push({ type: "user", id: queued.id, time: { created: Date.now() }, text: queued.payload.text ?? "" })
-        this.emit("session.inbox.delivered", { sessionID: id, inboxID: queued.id })
-        replyTo = queued.payload.text
-        continue
+        // Deliver a queued message, if any, as the next turn.
+        const queued = this.inboxes.get(id)?.shift()
+        if (queued) {
+          this.msgs.get(id)!.push({ type: "user", id: queued.id, time: { created: Date.now() }, text: queued.payload.text ?? "" })
+          this.emit("session.inbox.delivered", { sessionID: id, inboxID: queued.id })
+          replyTo = queued.payload.text
+          continue
+        }
+        if (!forever || rounds > 50) break
+        await this.sleep(2500 + Math.random() * 3000)
       }
-      if (!forever || rounds > 50) break
-      await this.sleep(2500 + Math.random() * 3000)
-    }
-    // The loop leaves `running` only when it finished its rounds; an interrupt
-    // removes the id first, so a still-present id means it completed on its own.
-    // (The old `|| !forever` also fired after an interrupt, overwriting
-    // "interrupted" with "succeeded".)
-    const completed = this.running.has(id)
-    this.running.delete(id)
-    if (completed) {
+      // The loop leaves `running` only when it finished its rounds with its own
+      // run token intact; interrupt() removes the id and bumps the token first.
+      if (!isActive()) return
+      this.running.delete(id)
       s.outcome = "succeeded"
       s.time.updated = Date.now()
       s.time.idle = Date.now()
       this.emit("session.execution.succeeded", { sessionID: id })
+    } finally {
+      if (this.runTokens.get(id) === token) this.loopRunning.delete(id)
     }
   }
 
@@ -428,6 +457,7 @@ export class DemoBackend implements Backend {
   async compact(id: string, delivery?: Delivery) {
     const s = this.sessions.get(id)
     if (!s) throw new Error("Session not found")
+    if (!this.msgs.has(id)) this.msgs.set(id, [])
     const item: InboxItem = { id: uid("msg"), sessionID: id, type: "compaction", payload: {}, delivery: delivery ?? "steer", time: { created: Date.now() } }
     const message: Extract<Message, { type: "compaction" }> = {
       type: "compaction",
@@ -441,16 +471,36 @@ export class DemoBackend implements Backend {
     this.msgs.get(id)!.push(message)
     this.emit("session.inbox.enqueued", { sessionID: id, inboxID: item.id, item })
     this.emit("session.inbox.delivered", { sessionID: id, inboxID: item.id })
+    const startedAt = ++seq
+    const startedRun = !this.running.has(id)
+    const token = startedRun ? this.nextToken(id) : this.runTokens.get(id)
+    if (startedRun) {
+      this.running.add(id)
+      s.outcome = undefined
+      this.emit("session.execution.started", { sessionID: id })
+    }
     this.emit("session.compaction.started", { sessionID: id, reason: "manual", recent: "" })
     setTimeout(() => {
+      if ((this.interrupts.get(id) ?? 0) > startedAt) {
+        message.status = "failed"
+        this.emit("session.compaction.failed", { sessionID: id, reason: "manual" })
+        return
+      }
       message.status = "completed"
       message.summary = "Earlier turns summarized so the session keeps working with a smaller context."
       this.emit("session.compaction.ended", { sessionID: id, reason: "manual", text: message.summary, recent: "" })
+      if (startedRun && this.running.has(id) && this.runTokens.get(id) === token) {
+        this.running.delete(id)
+        s.outcome = "succeeded"
+        s.time.updated = Date.now()
+        s.time.idle = Date.now()
+        this.emit("session.execution.succeeded", { sessionID: id })
+      }
     }, 900 + Math.random() * 900)
   }
   async listFolders(path: string) {
     if (path === "/Users/you" || path === "/Users/you/") return ["code", "Desktop", "Documents"]
-    if (path.startsWith("/Users/you/code")) return this.projects.map((p) => p.canonical.split("/").pop()!).concat("new-idea")
+    if (path.startsWith("/Users/you/code")) return this.projects.map((p) => basename(p.canonical)).concat("new-idea")
     return []
   }
   async switchModel(id: string, model: ModelRef) {
@@ -465,7 +515,7 @@ export class DemoBackend implements Backend {
   async createSession(directory: string, model?: ModelRef, permissions?: PermissionRule[]) {
     let proj = this.projects.find((p) => p.canonical === directory)
     if (!proj) {
-      proj = { id: uid("p"), name: directory.split("/").filter(Boolean).pop() ?? directory, canonical: directory }
+      proj = { id: uid("p"), name: basename(directory) || directory, canonical: directory }
       this.projects.push(proj)
     }
     const now = Date.now()
@@ -488,6 +538,7 @@ export class DemoBackend implements Backend {
   async prompt(id: string, input: PromptInput) {
     const s = this.sessions.get(id)
     if (!s) throw new Error("Session not found")
+    if (!this.msgs.has(id)) this.msgs.set(id, [])
     const item: InboxItem = { id: uid("msg"), sessionID: id, type: "user", payload: { text: input.text }, delivery: input.delivery ?? "steer" }
     this.emit("session.inbox.enqueued", { sessionID: id, inboxID: item.id, item })
     if (this.running.has(id) && input.delivery === "queue") {
@@ -499,9 +550,11 @@ export class DemoBackend implements Backend {
     this.emit("session.inbox.delivered", { sessionID: id, inboxID: item.id })
     if (!s.title) {
       s.title = input.text.slice(0, 48)
-      setTimeout(() => this.emit("session.renamed", { sessionID: id, title: s.title }), 1200)
+      setTimeout(() => {
+        if (this.sessions.has(id)) this.emit("session.renamed", { sessionID: id, title: s.title })
+      }, 1200)
     }
-    if (!this.running.has(id)) void this.loop(id, false, input.text)
+    if (!this.loopRunning.has(id)) void this.loop(id, false, input.text)
   }
   async markViewed(id: string, idle: number) {
     const s = this.sessions.get(id)
@@ -509,6 +562,9 @@ export class DemoBackend implements Backend {
   }
   async interrupt(id: string) {
     if (!this.running.delete(id)) return
+    this.loopRunning.delete(id)
+    this.nextToken(id)
+    this.interrupts.set(id, ++seq)
     const s = this.sessions.get(id)
     if (s) {
       s.outcome = "interrupted"

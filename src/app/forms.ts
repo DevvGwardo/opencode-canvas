@@ -23,7 +23,7 @@ function validFormat(value: string, format?: FormField["format"]): boolean {
     const date = new Date(`${value}T00:00:00Z`)
     return /^\d{4}-\d{2}-\d{2}$/.test(value) && Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === value
   }
-  return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value)
+  return /^\d{4}-\d{2}-\d{2}[Tt](?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?(?:[Zz]|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/.test(value)
     && validFormat(value.slice(0, 10), "date") && Number.isFinite(Date.parse(value))
 }
 
@@ -143,7 +143,7 @@ export function questionForm(
           customRadio = h("input")
           customRadio.type = "radio"
           customRadio.name = name
-          customRadio.checked = typeof f.default === "string" && !f.options?.some((o) => o.value === f.default)
+          customRadio.checked = typeof f.default === "string" && f.default !== "" && !f.options?.some((o) => o.value === f.default)
           custom.value = customRadio.checked ? f.default : ""
           const radio = customRadio
           custom.addEventListener("input", () => { radio.checked = true })
@@ -186,7 +186,7 @@ export function questionForm(
       if (f.default !== undefined) input.value = String(f.default)
       input.required = !!f.required
       field.append(input)
-      getters.push([f.key, () => numeric ? input.value === "" ? undefined : Number(input.value) : input.value])
+      getters.push([f.key, () => numeric ? input.value.trim() === "" ? undefined : Number(input.value) : input.value])
     }
     fieldsets.push([f, field])
     body.append(field)
@@ -225,7 +225,7 @@ export function questionForm(
       await fn()
       completed = true
     } catch (e) {
-      error.textContent = (e as Error).message
+      error.textContent = (e as Error)?.message ?? String(e)
       error.hidden = false
     } finally {
       busy = false
@@ -244,7 +244,7 @@ export function questionForm(
       const answer = formAnswer(form.fields, values())
       void act(() => reply(answer))
     } catch (e) {
-      error.textContent = (e as Error).message
+      error.textContent = (e as Error)?.message ?? String(e)
       error.hidden = false
     }
   })
