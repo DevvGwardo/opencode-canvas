@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from "bun:test"
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { createServer } from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -238,9 +238,13 @@ test("a transport failure never automatically resends a write", async () => {
 
 test("/canvas/config omits empty authorization and rediscovers a moved upstream", async () => {
   const dir = await mkdtemp(join(tmpdir(), "canvas-rediscover-"))
+  const configDir = join(dir, "config")
+  const binDir = join(dir, "bin")
+  await mkdir(configDir, { recursive: true })
+  await mkdir(binDir, { recursive: true })
   const prevConfig = process.env.XDG_CONFIG_HOME
   const prevUpPass = process.env.OPENCODE_SERVER_PASSWORD
-  process.env.XDG_CONFIG_HOME = dir
+  process.env.XDG_CONFIG_HOME = configDir
   delete process.env.OPENCODE_SERVER_PASSWORD
   const seenAuthHeaders: Array<string | null> = []
   const makeUpstream = () => Bun.serve({
@@ -256,14 +260,14 @@ test("/canvas/config omits empty authorization and rediscovers a moved upstream"
   let up3: Bun.Server<unknown> | undefined
   const urlFile = join(dir, "upstream-url")
   await writeFile(urlFile, `http://127.0.0.1:${up1.port}`)
-  const js = join(dir, "opencode.js")
+  const js = join(binDir, "opencode.js")
   await writeFile(js, `const fs = require("node:fs"); console.log(fs.readFileSync(${JSON.stringify(urlFile)}, "utf8"));`)
   let bin: string
   if (process.platform === "win32") {
-    bin = join(dir, "opencode.cmd")
+    bin = join(binDir, "opencode.cmd")
     await writeFile(bin, `@echo off\r\n"${process.execPath}" "${js}" %*\r\n`)
   } else {
-    bin = join(dir, "opencode")
+    bin = join(binDir, "opencode")
     await writeFile(bin, `#!/bin/sh\nexec "${process.execPath}" "${js}" "$@"\n`)
     await chmod(bin, 0o755)
   }

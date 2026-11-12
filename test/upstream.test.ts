@@ -24,14 +24,16 @@ afterEach(() => {
 })
 
 async function makeFakeOpencode(dir: string, scriptBody: string) {
-  const js = join(dir, "fake-opencode.js")
+  const binDir = join(dir, "bin")
+  await mkdir(binDir, { recursive: true })
+  const js = join(binDir, "fake-opencode.js")
   await writeFile(js, scriptBody)
   if (process.platform === "win32") {
-    const cmd = join(dir, "opencode.cmd")
+    const cmd = join(binDir, "opencode.cmd")
     await writeFile(cmd, `@echo off\r\n"${process.execPath}" "${js}" %*\r\n`)
     return cmd
   }
-  const sh = join(dir, "opencode")
+  const sh = join(binDir, "opencode")
   await writeFile(sh, `#!/bin/sh\nexec "${process.execPath}" "${js}" "$@"\n`)
   await chmod(sh, 0o755)
   return sh
@@ -67,9 +69,10 @@ describe("upstream resolution", () => {
   test("discovers the service URL with ANSI codes and reads service.json password", async () => {
     const dir = await mkdtemp(join(tmpdir(), "canvas-upstream-"))
     try {
-      process.env.XDG_CONFIG_HOME = dir
-      await mkdir(join(dir, "opencode"), { recursive: true })
-      await writeFile(join(dir, "opencode", "service.json"), JSON.stringify({ password: "service-secret-pass" }))
+      const configDir = join(dir, "config")
+      process.env.XDG_CONFIG_HOME = configDir
+      await mkdir(join(configDir, "opencode"), { recursive: true })
+      await writeFile(join(configDir, "opencode", "service.json"), JSON.stringify({ password: "service-secret-pass" }))
       const bin = await makeFakeOpencode(dir, `
         if (process.argv[2] === "service" && process.argv[3] === "status") {
           console.log("\\x1b[32mhttp://127.0.0.1:4096\\x1b[0m")
@@ -86,7 +89,9 @@ describe("upstream resolution", () => {
     const dir = await mkdtemp(join(tmpdir(), "canvas-upstream-start-"))
     let childPid: number | undefined
     try {
-      process.env.XDG_CONFIG_HOME = dir
+      const configDir = join(dir, "config")
+      await mkdir(configDir, { recursive: true })
+      process.env.XDG_CONFIG_HOME = configDir
       const marker = join(dir, "started")
       const pidFile = join(dir, "child.pid")
       const bin = await makeFakeOpencode(dir, `
