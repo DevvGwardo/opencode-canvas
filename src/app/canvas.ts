@@ -109,6 +109,13 @@ export class CanvasView {
   private openId?: string
   private accentH = 0
   private tabStopsDirty = false
+  private ro: ResizeObserver
+  private offStore: () => void
+  private refreshTimer: ReturnType<typeof setInterval>
+  private rafId?: number
+  private labelTimers = new Set<ReturnType<typeof setTimeout>>()
+  private ac = new AbortController()
+  private destroyed = false
   selected?: string
 
   constructor(
@@ -130,22 +137,36 @@ export class CanvasView {
     host.append(this.stage)
 
     this.camera = new Camera(() => this.kick())
-    const ro = new ResizeObserver(() => {
+    this.ro = new ResizeObserver(() => {
       this.camera.setViewport(this.stage.clientWidth, this.stage.clientHeight)
       this.cameraDirty = true
       this.needsLayout = true
       this.kick()
     })
-    ro.observe(this.stage)
+    this.ro.observe(this.stage)
     this.camera.setViewport(this.stage.clientWidth || innerWidth, this.stage.clientHeight || innerHeight)
 
     this.bindInput()
 
-    store.on({
+    this.offStore = store.on({
       structure: () => this.sync(),
       cards: (ids) => this.updateCards(ids),
     })
-    setInterval(() => this.updateCards(new Set(this.cards.keys())), 30_000)
+    this.refreshTimer = setInterval(() => this.updateCards(new Set(this.cards.keys())), 30_000)
+  }
+
+  destroy() {
+    if (this.destroyed) return
+    this.destroyed = true
+    this.ro.disconnect()
+    this.offStore()
+    clearInterval(this.refreshTimer)
+    if (this.rafId !== undefined) cancelAnimationFrame(this.rafId)
+    this.rafId = undefined
+    this.frameScheduled = false
+    for (const timer of this.labelTimers) clearTimeout(timer)
+    this.labelTimers.clear()
+    this.ac.abort()
   }
 
   // ---- public ---------------------------------------------------------------
@@ -211,11 +232,17 @@ export class CanvasView {
   closeStack() {
     if (!this.expanded) return false
     const g = this.expanded
+    const wasFocused = this.stage.contains(document.activeElement)
     this.expanded = undefined
     // Lay out synchronously: relayout() is async, so fitting against this.result
     // here would frame the still-expanded columns instead of the collapsed pile.
     this.needsLayout = true
     this.doLayout()
+    const cur = this.selected ? this.cards.get(this.selected) : undefined
+    if (cur && cur.group === g && cur.root.classList.contains("inert")) {
+      const top = [...this.cards.values()].find((c) => c.group === g && !c.root.classList.contains("inert"))
+      if (top) this.select(top.id, false, wasFocused)
+    }
     const r = this.result?.groups.get(g)
     if (r) this.camera.fit(r, 120, Math.min(1, this.camera.z))
     this.kick()
@@ -249,6 +276,7 @@ export class CanvasView {
 
   /** Bring a card to the middle of the screen at a readable zoom. */
   centerOn(id: string, zoom?: number) {
+    if (this.needsLayout) this.doLayout()
     const c = this.cards.get(id)
     const t = c?.target
     if (!c || !t) return
@@ -256,6 +284,7 @@ export class CanvasView {
   }
 
   fitAll() {
+    if (this.needsLayout) this.doLayout()
     if (!this.result) return
     this.camera.fit(this.result.bounds, 72, 1)
   }
@@ -266,6 +295,14 @@ export class CanvasView {
 
   hasSession(id: string) {
     return this.cards.has(id)
+  }
+
+  canJumpTo(id: string) {
+    const c = this.cards.get(id)
+    if (!c) return false
+    if (!this.query && !this.statusFilter) return true
+    if (this.needsLayout) this.doLayout()
+    return !!c.target?.interactive && c.target.opacity > 0.5
   }
 
   // ---- reconciliation -------------------------------------------------------
@@ -294,8 +331,10 @@ export class CanvasView {
   }
 
   private sync() {
+    if (this.destroyed) return
     const groups = this.store.groups()
     this.groupsCache = groups
+    if (this.expanded && !groups.some((g) => g.key === this.expanded)) this.expanded = undefined
     const seen = new Set<string>()
     let added = 0
     for (const g of groups) {
@@ -323,6 +362,7 @@ export class CanvasView {
       if (seen.has(id)) continue
       c.root.remove()
       this.cards.delete(id)
+      this.collapsed.delete(id)
       if (this.selected === id) this.selected = undefined
     }
     this.updateCards(new Set(this.cards.keys()))
@@ -350,6 +390,7 @@ export class CanvasView {
   }
 
   private updateCards(ids: Set<string>) {
+    if (this.destroyed) return
     const now = Date.now()
     for (const id of ids) {
       const c = this.cards.get(id)
@@ -458,7 +499,7 @@ export class CanvasView {
       this.firstLayout = false
       this.initialCamera()
     } else if (this.fitAfterLayout) {
-      const b = this.query ? (this.result.groups.get("__search") ?? this.result.bounds) : this.result.bounds
+      const b = this.query || this.statusFilter ? (this.result.groups.get("__search") ?? this.result.bounds) : this.result.bounds
       this.camera.fit(b, 72, 1)
     }
     this.fitAfterLayout = false
@@ -499,12 +540,14 @@ export class CanvasView {
     for (const [k, e] of this.labels) {
       if (seen.has(k)) continue
       e.classList.add("gone")
-      setTimeout(() => {
+      const timer = setTimeout(() => {
+        this.labelTimers.delete(timer)
         if (e.classList.contains("gone")) {
           e.remove()
           this.labels.delete(k)
         }
       }, 400)
+      this.labelTimers.add(timer)
     }
   }
 
@@ -568,13 +611,15 @@ export class CanvasView {
   // ---- frame loop -----------------------------------------------------------
 
   kick() {
-    if (this.frameScheduled) return
+    if (this.frameScheduled || this.destroyed) return
     this.frameScheduled = true
-    requestAnimationFrame((t) => this.frame(t))
+    this.rafId = requestAnimationFrame((t) => this.frame(t))
   }
 
   private frame(now: number) {
     this.frameScheduled = false
+    this.rafId = undefined
+    if (this.destroyed) return
     const dt = Math.min(1 / 30, Math.max(0.001, (now - this.lastFrame) / 1000))
     this.lastFrame = now
 
@@ -657,6 +702,7 @@ export class CanvasView {
 
   private bindInput() {
     const stage = this.stage
+    const signal = this.ac.signal
     // Safari trackpad pinch fires both gesture* events and synthetic ctrl-wheel
     // events for the same gesture; prefer the gesture events so one pinch doesn't
     // apply the zoom twice.
@@ -673,23 +719,31 @@ export class CanvasView {
           this.camera.panBy(e.deltaX * k, e.deltaY * k)
         }
       },
-      { passive: false },
+      { passive: false, signal },
     )
 
     // Safari trackpad pinch.
     let gestureScale = 1
-    stage.addEventListener("gesturestart", (e: any) => {
-      e.preventDefault()
-      gestureScale = 1
-      lastGesture = performance.now()
-    })
-    stage.addEventListener("gesturechange", (e: any) => {
-      e.preventDefault()
-      lastGesture = performance.now()
-      const r = stage.getBoundingClientRect()
-      this.camera.zoomAt(e.scale / gestureScale, e.clientX - r.left, e.clientY - r.top)
-      gestureScale = e.scale
-    })
+    stage.addEventListener(
+      "gesturestart",
+      (e: any) => {
+        e.preventDefault()
+        gestureScale = 1
+        lastGesture = performance.now()
+      },
+      { signal },
+    )
+    stage.addEventListener(
+      "gesturechange",
+      (e: any) => {
+        e.preventDefault()
+        lastGesture = performance.now()
+        const r = stage.getBoundingClientRect()
+        if (gestureScale > 0 && e.scale > 0) this.camera.zoomAt(e.scale / gestureScale, e.clientX - r.left, e.clientY - r.top)
+        gestureScale = e.scale
+      },
+      { signal },
+    )
 
     const pointers = new Map<number, { x: number; y: number }>()
     let drag:
@@ -697,58 +751,73 @@ export class CanvasView {
       | undefined
     let pinch: { d: number; mx: number; my: number } | undefined
 
-    stage.addEventListener("pointerdown", (e) => {
-      if (e.button !== 0 && e.pointerType === "mouse") return
-      pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
-      if (pointers.size === 2) {
-        const [a, b] = [...pointers.values()]
-        pinch = { d: Math.hypot(a.x - b.x, a.y - b.y), mx: (a.x + b.x) / 2, my: (a.y + b.y) / 2 }
-        drag = undefined
-        this.camera.hold()
-        return
-      }
-      drag = {
-        id: e.pointerId,
-        x0: e.clientX,
-        y0: e.clientY,
-        x: e.clientX,
-        y: e.clientY,
-        panning: false,
-        samples: [{ x: e.clientX, y: e.clientY, t: performance.now() }],
-      }
-    })
+    stage.addEventListener(
+      "pointerdown",
+      (e) => {
+        if (e.button !== 0 && e.pointerType === "mouse") return
+        pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+        if (pointers.size === 2) {
+          const [a, b] = [...pointers.values()]
+          pinch = { d: Math.hypot(a.x - b.x, a.y - b.y), mx: (a.x + b.x) / 2, my: (a.y + b.y) / 2 }
+          drag = undefined
+          this.camera.hold()
+          return
+        }
+        drag = {
+          id: e.pointerId,
+          x0: e.clientX,
+          y0: e.clientY,
+          x: e.clientX,
+          y: e.clientY,
+          panning: false,
+          samples: [{ x: e.clientX, y: e.clientY, t: performance.now() }],
+        }
+      },
+      { signal },
+    )
 
-    stage.addEventListener("pointermove", (e) => {
-      if (!pointers.has(e.pointerId)) return
-      pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
-      if (pinch && pointers.size >= 2) {
-        const [a, b] = [...pointers.values()]
-        const d = Math.hypot(a.x - b.x, a.y - b.y)
-        const mx = (a.x + b.x) / 2
-        const my = (a.y + b.y) / 2
-        const r = stage.getBoundingClientRect()
-        this.camera.panBy(pinch.mx - mx, pinch.my - my)
-        this.camera.zoomAt(d / pinch.d, mx - r.left, my - r.top)
-        pinch = { d, mx, my }
-        return
-      }
-      if (!drag || drag.id !== e.pointerId) return
-      if (!drag.panning && Math.hypot(e.clientX - drag.x0, e.clientY - drag.y0) > 5) {
-        drag.panning = true
-        stage.setPointerCapture(e.pointerId)
-        stage.classList.add("grabbing")
-        this.camera.hold()
-      }
-      if (drag.panning) {
-        this.camera.panBy(drag.x - e.clientX, drag.y - e.clientY)
-        this.camera.hold()
-        const t = performance.now()
-        drag.samples.push({ x: e.clientX, y: e.clientY, t })
-        while (drag.samples.length > 2 && t - drag.samples[0].t > 90) drag.samples.shift()
-      }
-      drag.x = e.clientX
-      drag.y = e.clientY
-    })
+    stage.addEventListener(
+      "pointermove",
+      (e) => {
+        if (!pointers.has(e.pointerId)) return
+        pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+        if (pinch && pointers.size >= 2) {
+          const [a, b] = [...pointers.values()]
+          const d = Math.hypot(a.x - b.x, a.y - b.y)
+          const mx = (a.x + b.x) / 2
+          const my = (a.y + b.y) / 2
+          const r = stage.getBoundingClientRect()
+          this.camera.panBy(pinch.mx - mx, pinch.my - my)
+          if (pinch.d > 0 && d > 0) this.camera.zoomAt(d / pinch.d, mx - r.left, my - r.top)
+          pinch = { d, mx, my }
+          return
+        }
+        if (!drag || drag.id !== e.pointerId) return
+        if (!drag.panning && Math.hypot(e.clientX - drag.x0, e.clientY - drag.y0) > 5) {
+          drag.panning = true
+          try {
+            stage.setPointerCapture(e.pointerId)
+          } catch {
+            /* synthetic/detached pointer */
+          }
+          stage.classList.add("grabbing")
+          this.camera.hold()
+        }
+        if (drag.panning) {
+          this.camera.panBy(drag.x - e.clientX, drag.y - e.clientY)
+          this.camera.hold()
+          const t = performance.now()
+          drag.samples.push({ x: e.clientX, y: e.clientY, t })
+          while (drag.samples.length > 2 && t - drag.samples[0].t > 90) drag.samples.shift()
+        }
+        drag.x = e.clientX
+        drag.y = e.clientY
+      },
+      { signal },
+    )
+
+    const targetEl = (t: EventTarget | null) =>
+      t instanceof Element ? t : t instanceof Node ? t.parentElement : null
 
     const end = (e: PointerEvent) => {
       pointers.delete(e.pointerId)
@@ -772,47 +841,79 @@ export class CanvasView {
         return
       }
       if (e.type === "pointercancel") return
-      const target = (e.target as HTMLElement).closest<HTMLElement>(".card")
-      const fold = (e.target as HTMLElement).closest(".card-sub")
-      if (target && fold && this.layoutName === "agents" && !this.query && target.classList.contains("has-sub"))
+      const el = targetEl(e.target)
+      const target = el?.closest<HTMLElement>(".card")
+      const fold = el?.closest(".card-sub")
+      const flatFiltered = !!this.query || !!this.statusFilter
+      if (target && fold && this.layoutName === "agents" && !flatFiltered && target.classList.contains("has-sub"))
         this.toggleCollapsed(target.dataset.id!)
       else if (target && !target.classList.contains("inert")) this.activate(target.dataset.id!)
       else {
-        const lbl = (e.target as HTMLElement).closest<HTMLElement>(".group-label")
-        if (lbl?.dataset.group && this.layoutName === "fold" && !this.query) this.openStack(lbl.dataset.group)
+        const lbl = el?.closest<HTMLElement>(".group-label")
+        if (lbl?.dataset.group && this.layoutName === "fold" && !flatFiltered) this.openStack(lbl.dataset.group)
       }
     }
-    stage.addEventListener("pointerup", end)
-    stage.addEventListener("pointercancel", end)
+    stage.addEventListener("pointerup", end, { signal })
+    stage.addEventListener("pointercancel", end, { signal })
+    window.addEventListener(
+      "blur",
+      () => {
+        if (!pointers.size && !drag && !pinch) return
+        pointers.clear()
+        drag = undefined
+        pinch = undefined
+        stage.classList.remove("grabbing")
+        this.camera.release(0, 0)
+      },
+      { signal },
+    )
 
-    stage.addEventListener("dblclick", (e) => {
-      if ((e.target as HTMLElement).closest(".card")) return
-      this.fitAll()
-    })
+    stage.addEventListener(
+      "dblclick",
+      (e) => {
+        if (targetEl(e.target)?.closest(".card")) return
+        this.fitAll()
+      },
+      { signal },
+    )
 
     // Roving tabindex: Tab reaches the canvas once (at the selected card)
     // instead of once per session, and the arrow keys move within it. A focused
     // card activates with Enter or Space, like a real button.
-    stage.addEventListener("focusin", (e) => {
-      const id = (e.target as HTMLElement | null)?.closest?.<HTMLElement>(".card")?.dataset.id
-      if (id && id !== this.selected) this.select(id, false)
-    })
-    stage.addEventListener("keydown", (e) => {
-      if (e.key !== "Enter" && e.key !== " " && e.key !== "Spacebar") return
-      const id = (e.target as HTMLElement | null)?.closest?.<HTMLElement>(".card")?.dataset.id
-      if (!id) return
-      e.preventDefault()
-      e.stopPropagation()
-      this.activate(id)
-    })
+    stage.addEventListener(
+      "focusin",
+      (e) => {
+        const id = targetEl(e.target)?.closest<HTMLElement>(".card")?.dataset.id
+        if (id && id !== this.selected) this.select(id, false)
+      },
+      { signal },
+    )
+    stage.addEventListener(
+      "keydown",
+      (e) => {
+        if (e.key !== "Enter" && e.key !== " " && e.key !== "Spacebar") return
+        const id = targetEl(e.target)?.closest<HTMLElement>(".card")?.dataset.id
+        if (!id) return
+        e.preventDefault()
+        e.stopPropagation()
+        this.activate(id)
+      },
+      { signal },
+    )
   }
 
   activate(id: string) {
+    if (this.needsLayout) this.doLayout()
     const c = this.cards.get(id)
     if (!c) return
+    const flatFiltered = !!this.query || !!this.statusFilter
+    if (this.layoutName === "fold" && !flatFiltered && c.kind === "session" && this.expanded !== c.group) {
+      this.select(id, false)
+      return this.openStack(c.group)
+    }
+    if (c.root.classList.contains("inert") || c.target?.interactive === false) return
     this.select(id, false)
     if (c.kind === "new") return this.handlers.newSession(c.group)
-    if (this.layoutName === "fold" && !this.query && this.expanded !== c.group) return this.openStack(c.group)
     this.handlers.open(id)
   }
 
@@ -879,6 +980,7 @@ export class CanvasView {
   }
 
   moveSelection(dx: number, dy: number) {
+    if (this.needsLayout) this.doLayout()
     const candidates = [...this.cards.values()].filter((c) => c.target?.interactive && (c.target?.opacity ?? 0) > 0.5)
     if (!candidates.length) return
     // Move DOM focus with the selection when the keys came from the canvas, so
@@ -886,7 +988,7 @@ export class CanvasView {
     const keyboard = this.stage.contains(document.activeElement)
     const center = (c: CardView) => ({ x: c.target!.x + CARD_W / 2, y: c.target!.y + c.h / 2 })
     const cur = this.selected ? this.cards.get(this.selected) : undefined
-    if (!cur?.target) {
+    if (!cur?.target || !cur.target.interactive || cur.target.opacity <= 0.5) {
       const mid = { x: this.camera.cx, y: this.camera.cy }
       const best = candidates.reduce((a, b) => {
         const da = Math.hypot(center(a).x - mid.x, center(a).y - mid.y)

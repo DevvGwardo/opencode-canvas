@@ -27,7 +27,9 @@ export async function ensureAccess(root: HTMLElement): Promise<boolean> {
     root.replaceChildren(box)
     box.addEventListener("submit", async (e) => {
       e.preventDefault()
+      if (button.disabled) return
       button.disabled = true
+      box.setAttribute("aria-busy", "true")
       error.textContent = ""
       try {
         const login = await fetch("/canvas/auth", {
@@ -54,6 +56,7 @@ export async function ensureAccess(root: HTMLElement): Promise<boolean> {
         input.focus()
       } finally {
         button.disabled = false
+        box.removeAttribute("aria-busy")
       }
     })
     input.focus()

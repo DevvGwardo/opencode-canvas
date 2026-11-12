@@ -55,7 +55,7 @@ export function createNewCard(groupKey: string): HTMLElement {
   root.setAttribute("role", "button")
   // Roving tabindex: the canvas gives exactly one card tabindex 0.
   root.tabIndex = -1
-  root.innerHTML = `<span class="plus">+</span> New session`
+  root.innerHTML = `<span class="plus" aria-hidden="true">+</span> New session`
   return root
 }
 
@@ -96,27 +96,29 @@ export function updateSessionCard(c: CardEls, store: Store, id: string, now = Da
     bullets = []
     pending = true
   }
+  const status = store.status(id, now)
+  const isWorkingCard = status === "working"
   setText(c.text, body)
   c.text.classList.toggle("pending", pending)
   // Fixed-height body: streaming text never changes the card's size. Before
   // the preview loads, reserve the space so the layout doesn't jump.
-  c.body.classList.toggle("empty", !!preview && !body && !bullets.length)
+  c.body.classList.toggle("empty", !isWorkingCard && !working && !!preview && !body && !bullets.length)
   const bulletKey = bullets.join("\u0001")
   if (c.bullets.dataset.key !== bulletKey) {
     c.bullets.dataset.key = bulletKey
     c.bullets.replaceChildren(...bullets.map((b) => el("li", "", b)))
   }
 
-  const status = store.status(id, now)
   const fresh = status === "failed" && store.unseen(id) && now - (s.time.idle ?? 0) < REVIEW_WINDOW
   const state = `${status}:${ask ?? ""}:${fresh}`
   if (state !== c.state) {
     c.state = state
     c.status.replaceChildren()
     for (const st of STATUSES) c.root.classList.toggle(`st-${st}`, st === status)
+    c.root.classList.toggle("working", isWorkingCard)
     c.root.classList.toggle("fresh", fresh)
     c.root.dataset.status = status
-    if (status === "working") c.status.append(spinner(13), el("span", "label"))
+    if (isWorkingCard) c.status.append(spinner(13), el("span", "label"))
     else c.status.append(el("span", `mark ${status}`), el("span", "label"))
   }
   const label = c.status.querySelector<HTMLElement>(".label")!
@@ -152,7 +154,7 @@ export function updateSessionCard(c: CardEls, store: Store, id: string, now = Da
 }
 
 function duration(ms: number) {
-  const sec = Math.max(0, Math.round(ms / 1000))
+  const sec = Number.isFinite(ms) ? Math.max(0, Math.round(ms / 1000)) : 0
   if (sec < 60) return `${sec}s`
   const m = Math.floor(sec / 60)
   if (m < 60) return `${m}m ${String(sec % 60).padStart(2, "0")}s`

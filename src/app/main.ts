@@ -69,6 +69,7 @@ function segmented<T extends string>(items: readonly T[], labels: Record<T, stri
   const buttons = new Map<T, HTMLButtonElement>()
   for (const it of items) {
     const b = el("button", "seg-btn", labels[it]) as HTMLButtonElement
+    b.type = "button"
     b.setAttribute("role", "radio")
     b.addEventListener("click", () => {
       set(it)
@@ -85,6 +86,40 @@ function segmented<T extends string>(items: readonly T[], labels: Record<T, stri
   }
   set(current)
   return { group, set }
+}
+
+export type HashRoute = { kind: "none" } | { kind: "tiles" } | { kind: "session"; id: string }
+
+/** Decode a URL hash into a canvas route target. */
+export function parseHashRoute(hash: string): HashRoute {
+  const value = hash.startsWith("#") ? hash.slice(1) : hash
+  if (!value) return { kind: "none" }
+  if (value === "tiles") return { kind: "tiles" }
+  return { kind: "session", id: value }
+}
+
+/** Build the browser tab title summarizing sessions that want attention. */
+export function documentTitle(counts: Pick<Record<Status, number>, "needs-you" | "working" | "review" | "failed">): string {
+  const bits: string[] = []
+  if (counts["needs-you"]) bits.push(`${counts["needs-you"]} need${counts["needs-you"] === 1 ? "s" : ""} you`)
+  if (counts.working) bits.push(`${counts.working} working`)
+  const review = counts.review + counts.failed
+  if (review) bits.push(`${review} to review`)
+  return `${bits.length ? bits.join(" · ") + " — " : ""}OpenCode Canvas`
+}
+
+/** True when a keyboard target should consume text keys rather than global shortcuts. */
+export function isTextInputTarget(target: Element | null): boolean {
+  return !!target?.closest(
+    "input:not([type='checkbox']):not([type='radio']):not([type='button']):not([type='submit']):not([type='reset']), textarea, select, [contenteditable=''], [contenteditable='true'], [contenteditable='plaintext-only']",
+  )
+}
+
+/** True when a keyboard target is a native interactive control whose Enter/Space should activate itself. */
+export function isInteractiveControlTarget(target: Element | null): boolean {
+  return !!target?.closest(
+    "button, a[href], summary, [role='button'], [role='radio'], [role='checkbox'], input[type='checkbox'], input[type='radio'], input[type='button'], input[type='submit'], input[type='reset']",
+  )
 }
 
 function showUnavailable(root: HTMLElement, cfg: CanvasConfig) {
@@ -128,9 +163,26 @@ async function boot() {
 
   root.replaceChildren()
   root.classList.add("ready")
-  let browserBtn: HTMLButtonElement
+  let browserBtn: HTMLButtonElement | undefined
+  let help: HTMLButtonElement | undefined
+  let helpEl: HTMLElement | undefined
+  const onDocPointerDown = (e: PointerEvent) => {
+    if (!helpEl) return
+    const target = e.target instanceof Element ? e.target : null
+    if (target && (helpEl.contains(target) || help?.contains(target))) return
+    closeHelp()
+  }
+  const closeHelp = () => {
+    if (!helpEl) return
+    helpEl.remove()
+    helpEl = undefined
+    help?.setAttribute("aria-expanded", "false")
+    document.removeEventListener("pointerdown", onDocPointerDown)
+  }
+
   const browser = new BrowserPanel(root, () => {
     browserBtn?.classList.toggle("on", browser.isOpen)
+    browserBtn?.setAttribute("aria-pressed", String(browser.isOpen))
     window.dispatchEvent(new Event("resize"))
   })
 
@@ -151,12 +203,21 @@ async function boot() {
 
   panel = new SessionPanel(root, store, backend, canvas, () => {
     root.classList.remove("panel-open")
-    if (location.hash) history.replaceState(null, "", location.pathname + location.search)
-  }, (url) => browser.open(url))
+    if (!tiles.isOpen && !panel.isOpen && location.hash && location.hash !== "#tiles") {
+      history.replaceState(null, "", location.pathname + location.search)
+    }
+  }, (url) => {
+    closeHelp()
+    browser.open(url)
+  })
   panel.loops = loops
   loops.onChange(() => panel.refreshLoop())
 
   function openSession(id: string) {
+    if (!store.sessions.has(id)) return
+    closeHelp()
+    if (picker.isOpen) picker.close()
+    if (tiles.isOpen) tiles.close()
     const from = canvas.cardRect(id)
     canvas.select(id, false)
     canvas.centerOn(id, Math.max(0.9, Math.min(1, canvas.camera.z)))
@@ -188,9 +249,13 @@ async function boot() {
       if (control === "model") void panel.showModelPicker()
       if (control === "effort") void panel.showEffortPicker()
     }),
-    openBrowser: (url) => browser.open(url),
+    openBrowser: (url) => {
+      closeHelp()
+      browser.open(url)
+    },
     newSession: () => openPicker(),
     closed: () => {
+      canvas.stage.inert = false
       updateStats()
       if (location.hash === "#tiles") history.replaceState(null, "", location.pathname + location.search)
     },
@@ -199,14 +264,18 @@ async function boot() {
   tiles.loops = loops
   loops.onChange(() => tiles.refreshLoops())
   function openTiles() {
+    closeHelp()
+    if (picker.isOpen) picker.close()
     if (panel.isOpen) panel.close()
     tiles.open()
+    canvas.stage.inert = true
     history.replaceState(null, "", "#tiles")
     updateStats()
   }
 
   const picker = new NewSessionPicker(root, store, backend, demo ? "/Users/you" : cfg.home, createIn)
   const openPicker = () => {
+    closeHelp()
     const sel = canvas.selected ? store.sessions.get(canvas.selected) : undefined
     picker.open(sel?.location.directory)
   }
@@ -227,6 +296,8 @@ async function boot() {
   const chipEls = new Map<Status, HTMLButtonElement>()
   for (const st of CHIP_ORDER) {
     const b = el("button", `chip ${st}`) as HTMLButtonElement
+    b.type = "button"
+    b.setAttribute("aria-pressed", "false")
     b.innerHTML = `<span class="chip-dot"></span><span class="chip-n">0</span><span class="chip-label">${STATUS_LABEL[st].toLowerCase()}</span>`
     b.addEventListener("click", () => setFilter(canvas.filter === st ? undefined : st))
     chipEls.set(st, b)
@@ -234,6 +305,7 @@ async function boot() {
   }
   // One click approves every waiting permission request, everywhere.
   const allowAll = el("button", "chip-action allow", "Allow all") as HTMLButtonElement
+  allowAll.type = "button"
   allowAll.hidden = true
   allowAll.title = "Approve every waiting permission request once"
   allowAll.addEventListener("click", async () => {
@@ -242,6 +314,7 @@ async function boot() {
   })
   chipEls.get("needs-you")!.after(allowAll)
   const markAll = el("button", "chip-action", "Mark all reviewed") as HTMLButtonElement
+  markAll.type = "button"
   markAll.hidden = true
   markAll.addEventListener("click", () => {
     const t = Date.now()
@@ -264,6 +337,7 @@ async function boot() {
     }
     markAll.hidden = st !== "review"
     root.classList.toggle("filtering", !!st)
+    updateStats()
   }
 
   const search = el("label", "search")
@@ -279,34 +353,50 @@ async function boot() {
   const right = el("div", "top-right")
   if (demo) right.append(el("span", "badge", "Simulated"))
   const tilesBtn = el("button", "tiles-open-btn") as HTMLButtonElement
+  tilesBtn.type = "button"
+  tilesBtn.setAttribute("aria-pressed", "false")
   tilesBtn.innerHTML = `<span class="tiles-icon" aria-hidden="true"></span><span class="tiles-label">Tiles</span><span class="tiles-n"></span>`
   tilesBtn.title = "Every running session's chat, side by side (T)"
   tilesBtn.addEventListener("click", () => (tiles.isOpen ? tiles.close() : openTiles()))
   right.append(autoApproveToggle(store), autoDismissToggle(store), tilesBtn)
   browserBtn = el("button", "tiles-open-btn", "Browser") as HTMLButtonElement
+  browserBtn.type = "button"
+  browserBtn.setAttribute("aria-pressed", "false")
   browserBtn.classList.add("browser-open-btn")
   browserBtn.innerHTML = `<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" aria-hidden="true"><rect x="1.5" y="2" width="13" height="12" rx="2"/><path d="M1.5 5.5h13M4 3.7h.1M6 3.7h.1"/></svg><span class="browser-label">Browser</span>`
   browserBtn.setAttribute("aria-label", "Browser")
   browserBtn.title = "Interactive host browser (B)"
-  browserBtn.addEventListener("click", () => browser.isOpen ? browser.close() : browser.open())
+  browserBtn.addEventListener("click", () => {
+    closeHelp()
+    if (browser.isOpen) browser.close()
+    else browser.open()
+  })
   right.append(browserBtn)
   autoApprovedNotices(store)
   autoDismissedNotices(store)
   const newBtn = el("button", "new-btn") as HTMLButtonElement
-  newBtn.innerHTML = `<span class="plus">+</span><span class="new-label">New session</span>`
+  newBtn.type = "button"
+  newBtn.innerHTML = `<span class="plus" aria-hidden="true">+</span><span class="new-label">New session</span>`
   newBtn.title = "New session (N)"
   newBtn.addEventListener("click", () => openPicker())
   right.append(newBtn)
-  const help = el("button", "icon-btn", "?") as HTMLButtonElement
+  help = el("button", "icon-btn", "?") as HTMLButtonElement
+  help.type = "button"
   help.setAttribute("aria-label", "Keyboard shortcuts")
+  help.setAttribute("aria-expanded", "false")
   help.addEventListener("click", () => toggleHelp())
   right.append(help)
   if (protectedAccess) {
     const signOut = el("button", "tiles-open-btn sign-out", "Sign out") as HTMLButtonElement
+    signOut.type = "button"
     signOut.addEventListener("click", async () => {
-      const res = await fetch("/canvas/auth", { method: "DELETE" })
-      if (res.ok) location.reload()
-      else toast("Couldn't sign out. Try again.")
+      try {
+        const res = await fetch("/canvas/auth", { method: "DELETE" })
+        if (res.ok) location.reload()
+        else toast("Couldn't sign out. Try again.")
+      } catch {
+        toast("Couldn't sign out. Try again.")
+      }
     })
     right.append(signOut)
   }
@@ -342,21 +432,41 @@ async function boot() {
   }
 
   let searchTimer: ReturnType<typeof setTimeout> | undefined
+  const flushSearch = () => {
+    clearTimeout(searchTimer)
+    searchTimer = undefined
+    canvas.setQuery(searchInput.value)
+  }
+  const clearSearch = () => {
+    clearTimeout(searchTimer)
+    searchTimer = undefined
+    searchInput.value = ""
+    search.classList.remove("has-value")
+    canvas.setQuery("")
+  }
   searchInput.addEventListener("input", () => {
     clearTimeout(searchTimer)
-    searchTimer = setTimeout(() => canvas.setQuery(searchInput.value), 90)
     search.classList.toggle("has-value", !!searchInput.value)
+    if (!searchInput.value) {
+      searchTimer = undefined
+      canvas.setQuery("")
+      return
+    }
+    searchTimer = setTimeout(() => {
+      searchTimer = undefined
+      canvas.setQuery(searchInput.value)
+    }, 90)
   })
   searchInput.addEventListener("keydown", (e) => {
     e.stopPropagation()
     if (e.key === "Escape") {
       if (searchInput.value) {
-        searchInput.value = ""
-        canvas.setQuery("")
-        search.classList.remove("has-value")
+        e.preventDefault()
+        clearSearch()
       } else searchInput.blur()
     } else if (e.key === "Enter" || e.key === "ArrowDown") {
       e.preventDefault()
+      flushSearch()
       searchInput.blur()
       canvas.moveSelection(0, 1)
       if (e.key === "Enter" && canvas.selected) canvas.activate(canvas.selected)
@@ -379,18 +489,14 @@ async function boot() {
     const live = tiles.liveCount()
     tilesBtn.querySelector(".tiles-n")!.textContent = live ? String(live) : ""
     tilesBtn.classList.toggle("on", tiles.isOpen)
+    tilesBtn.setAttribute("aria-pressed", String(tiles.isOpen))
     tilesBtn.classList.toggle("live", counts.working + counts["needs-you"] > 0)
     // The tab title says what needs you, even from another tab.
-    const bits: string[] = []
-    if (counts["needs-you"]) bits.push(`${counts["needs-you"]} need${counts["needs-you"] === 1 ? "s" : ""} you`)
-    if (counts.working) bits.push(`${counts.working} working`)
-    const review = counts.review + counts.failed
-    if (review) bits.push(`${review} to review`)
-    const title = `${bits.length ? bits.join(" · ") + " — " : ""}OpenCode Canvas`
+    const title = documentTitle(counts)
     if (document.title !== title) document.title = title
   }
   // Relative times and the 48h review window move even without events.
-  setInterval(updateStats, 30_000)
+  const statsTimer = setInterval(updateStats, 30_000)
   const updateConn = (s: ConnectionState) => {
     dot.dataset.state = s
     dot.title =
@@ -401,14 +507,11 @@ async function boot() {
 
   // ---- help ----
 
-  let helpEl: HTMLElement | undefined
   function toggleHelp() {
-    if (helpEl) {
-      helpEl.remove()
-      helpEl = undefined
-      return
-    }
+    if (helpEl) return closeHelp()
     helpEl = el("div", "help")
+    helpEl.setAttribute("role", "dialog")
+    helpEl.setAttribute("aria-label", "Keyboard shortcuts")
     helpEl.innerHTML = `
       <h2>Canvas</h2>
       <dl>
@@ -446,8 +549,10 @@ async function boot() {
         <dt>/effort high</dt><dd>Change model effort (/effort opens the picker)</dd>
         <dt>/browser URL</dt><dd>Browse a URL on the host computer</dd>
       </dl>`
-    helpEl.addEventListener("click", () => toggleHelp())
+    helpEl.addEventListener("click", () => closeHelp())
     root.append(helpEl)
+    help?.setAttribute("aria-expanded", "true")
+    document.addEventListener("pointerdown", onDocPointerDown)
   }
 
   function jumpAttention(dir: 1 | -1) {
@@ -456,7 +561,7 @@ async function boot() {
     const list = order.flatMap((st) =>
       store
         .roots()
-        .filter((s) => store.inFilter(s.id, st, t) && canvas.hasSession(s.id))
+        .filter((s) => store.inFilter(s.id, st, t) && canvas.canJumpTo(s.id))
         .sort((a, b) => b.time.updated - a.time.updated)
         .map((s) => s.id),
     )
@@ -469,11 +574,11 @@ async function boot() {
 
   // ---- keyboard ----
 
-  window.addEventListener("keydown", (e) => {
+  const onWindowKey = (e: KeyboardEvent) => {
     const target = e.target instanceof Element ? e.target : null
-    if (target?.closest("input, textarea, select, [contenteditable='true'], [contenteditable='plaintext-only']")) return
+    if (isTextInputTarget(target)) return
     if (e.key === "Escape") {
-      if (helpEl) return toggleHelp()
+      if (helpEl) return closeHelp()
       if (picker.isOpen) return picker.close()
       if (browser.isOpen) return browser.close()
       if (panel.isOpen) return panel.close()
@@ -481,15 +586,12 @@ async function boot() {
         if (tiles.maximized) return tiles.toggleMax(tiles.maximized)
         return tiles.close()
       }
-      if (searchInput.value) {
-        searchInput.value = ""
-        search.classList.remove("has-value")
-        return canvas.setQuery("")
-      }
+      if (searchInput.value) return clearSearch()
       if (canvas.filter) return setFilter(undefined)
       if (canvas.closeStack()) return
       return canvas.select(undefined)
     }
+    if (picker.isOpen) return
     if (panel.isOpen) {
       // With the panel open, letter keys type into its composer (consistent with
       // every other letter) rather than triggering canvas shortcuts.
@@ -498,6 +600,7 @@ async function boot() {
     }
     if ((e.key === "b" || e.key === "B") && !e.metaKey && !e.ctrlKey && !e.altKey) {
       e.preventDefault()
+      closeHelp()
       return browser.isOpen ? browser.close() : browser.open()
     }
     if ((e.key === "t" || e.key === "T") && !e.metaKey && !e.ctrlKey && !e.altKey) {
@@ -536,6 +639,7 @@ async function boot() {
       return canvas.moveSelection(...dirs[e.key])
     }
     if (e.key === "Enter" && canvas.selected) {
+      if (isInteractiveControlTarget(target)) return
       e.preventDefault()
       return canvas.activate(canvas.selected)
     }
@@ -554,7 +658,8 @@ async function boot() {
     if (e.key.length === 1 && /\S/.test(e.key)) {
       searchInput.focus()
     }
-  })
+  }
+  window.addEventListener("keydown", onWindowKey)
 
   try {
     await store.start()
@@ -565,13 +670,40 @@ async function boot() {
   }
 
   // Deep links: /#tiles, /#ses_…
-  const hash = location.hash.slice(1)
-  if (hash === "tiles") openTiles()
-  if (hash && store.sessions.has(hash)) requestAnimationFrame(() => requestAnimationFrame(() => openSession(hash)))
-  window.addEventListener("pagehide", () => { store.stop(); browser.close() })
+  const applyHashRoute = (route: HashRoute) => {
+    if (route.kind === "tiles") {
+      openTiles()
+    } else if (route.kind === "session") {
+      if (store.sessions.has(route.id)) openSession(route.id)
+    } else {
+      closeHelp()
+      if (picker.isOpen) picker.close()
+      if (panel.isOpen) panel.close()
+      if (tiles.isOpen) tiles.close()
+    }
+  }
+  const initialRoute = parseHashRoute(location.hash)
+  if (initialRoute.kind === "tiles") openTiles()
+  else if (initialRoute.kind === "session" && store.sessions.has(initialRoute.id)) {
+    requestAnimationFrame(() => requestAnimationFrame(() => openSession(initialRoute.id)))
+  }
+  const onHashChange = () => applyHashRoute(parseHashRoute(location.hash))
+  window.addEventListener("hashchange", onHashChange)
+  window.addEventListener("pagehide", () => {
+    clearTimeout(searchTimer)
+    clearInterval(statsTimer)
+    closeHelp()
+    window.removeEventListener("keydown", onWindowKey)
+    window.removeEventListener("hashchange", onHashChange)
+    store.stop()
+    browser.close()
+    canvas.destroy()
+  })
   window.addEventListener("pageshow", (event) => { if (event.persisted) location.reload() })
 }
 
-void boot().catch((e) => {
-  showUnavailable(document.getElementById("app")!, { mode: "live", connected: false, error: (e as Error).message })
-})
+if (typeof document !== "undefined" && document.getElementById("app")) {
+  void boot().catch((e) => {
+    showUnavailable(document.getElementById("app")!, { mode: "live", connected: false, error: (e as Error).message })
+  })
+}

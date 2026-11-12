@@ -10,6 +10,7 @@ import { SessionPanel } from "../src/app/panel"
 import { NewSessionPicker } from "../src/app/picker"
 import { spinner } from "../src/app/spinners"
 import { Store } from "../src/app/store"
+import { toast } from "../src/app/toast"
 import { Transcript } from "../src/app/transcript"
 import type { FormInfo, Message, Page, Session } from "../src/app/types"
 
@@ -533,6 +534,155 @@ async function run() {
       assert(image.some((value, i) => i % 4 === 3 && value > 0), "The spinner never painted a frame")
     } finally {
       canvas.remove()
+    }
+  })
+
+  await check("working cards keep streaming body space and toggle .working class", async () => {
+    const { store } = setup()
+    store.previews.set("root", { text: "", bullets: [] })
+    const els = createSessionCard("root")
+    host.append(els.root)
+    try {
+      store.running.add("root")
+      updateSessionCard(els, store, "root")
+      assert(els.root.classList.contains("working"), "Working session card did not set .working class")
+      assert(!els.body.classList.contains("empty"), "Working session card collapsed .card-body before streaming")
+      store.running.delete("root")
+      updateSessionCard(els, store, "root")
+      assert(!els.root.classList.contains("working"), "Idle session card kept .working class")
+      assert(els.body.classList.contains("empty"), "Idle empty session card did not restore .empty")
+    } finally {
+      els.root.remove()
+      store.stop()
+    }
+  })
+
+  await check("filtered fold canvas opens hits directly, blocks hidden activation, and closeStack restores pile top", async () => {
+    const { store } = setup()
+    store.addSessions([{
+      ...store.sessions.get("root")!,
+      id: "idle2",
+      time: { created: 1, updated: 1 },
+    }, {
+      ...store.sessions.get("root")!,
+      id: "work1",
+      time: { created: 2, updated: 2 },
+    }])
+    store.running.add("work1")
+    const opened: string[] = []
+    const canvasHost = document.createElement("div")
+    document.body.append(canvasHost)
+    const canvas = new CanvasView(canvasHost, store, { open: (id) => opened.push(id), newSession: () => {} })
+    try {
+      canvas.setLayout("fold")
+      ;(canvas as any).sync()
+      canvas.select("idle2", false)
+      canvas.setStatusFilter("working")
+      assert(canvas.canJumpTo("work1") && !canvas.canJumpTo("idle2"), "canJumpTo did not filter out non-matching sessions")
+      // Pressing arrow moves away from non-interactive stale selection onto visible hit.
+      canvas.moveSelection(0, 1)
+      assert(canvas.selected === "work1", `moveSelection failed to escape hidden card: ${canvas.selected}`)
+      // Filtered Fold card activates straight into open(), not openStack().
+      canvas.activate("work1")
+      assert(opened.includes("work1") && !(canvas as any).expanded, "Filtered fold card expanded a stack instead of opening")
+      // Filtered-out card cannot be activated directly.
+      opened.length = 0
+      canvas.activate("idle2")
+      assert(opened.length === 0, "Filtered-out card activated while inert")
+      // Clearing filter restores Fold stack behavior and closeStack moves selection off buried cards.
+      canvas.setStatusFilter(undefined)
+      const groupKey = store.groupKey(store.sessions.get("root")!)
+      canvas.openStack(groupKey)
+      canvas.select("idle2", false)
+      assert(canvas.closeStack(), "closeStack did not close open Fold stack")
+      const selCard = canvasHost.querySelector<HTMLElement>(`.card[data-id="${canvas.selected}"]`)
+      assert(!!selCard && !selCard.classList.contains("inert"), "closeStack left selection on an inert buried card")
+    } finally {
+      canvas.destroy()
+      canvasHost.remove()
+      store.stop()
+    }
+  })
+
+  await check("picker traps focus with inert background, preserves saved variant, handles Escape on header controls, and completes Windows paths", async () => {
+    localStorage.setItem("occ.model", JSON.stringify({ providerID: "p", id: "m1", variant: "high" }))
+    const modelFor = (dir?: string) => dir === "/no-variant"
+      ? [{ id: "m2", providerID: "p", name: "No Variants" }]
+      : [{ id: "m1", providerID: "p", name: "Primary", variants: ["low", "high"] }]
+    const { store, backend } = setup({
+      listModels: async (dir) => modelFor(dir),
+      serverDefaultModel: async (dir) => modelFor(dir)[0],
+      listFolders: async (dir) => (dir === "C:\\Users\\torre" ? ["projects", "notes"] : []),
+    })
+    store.addSessions([
+      { ...store.sessions.get("root")!, id: "nv", projectID: "nv", location: { directory: "/no-variant" }, time: { created: 5, updated: 5 } },
+      { ...store.sessions.get("root")!, id: "v", projectID: "v", location: { directory: "/with-variant" }, time: { created: 10, updated: 10 } },
+    ])
+    const pickerHost = document.createElement("div")
+    const outsideBtn = document.createElement("button")
+    outsideBtn.textContent = "Outside"
+    pickerHost.append(outsideBtn)
+    document.body.append(pickerHost)
+    outsideBtn.focus()
+    const picker = new NewSessionPicker(pickerHost, store, backend, "C:\\Users\\torre", async () => {})
+    try {
+      picker.open("/no-variant")
+      await (picker as any).renderModelButton()
+      assert(outsideBtn.inert === true, "Opening picker did not mark background host children inert")
+      assert(localStorage.getItem("occ.model")!.includes('"variant":"high"'), "Switching onto a variant-less project clobbered saved occ.model")
+      const dialog = pickerHost.querySelector<HTMLElement>(".picker")!
+      assert(dialog.getAttribute("aria-modal") === "true", "Picker dialog missing aria-modal")
+      const input = pickerHost.querySelector<HTMLInputElement>(".picker-input")!
+      input.value = "~/pro"
+      await (picker as any).refresh()
+      const opt = pickerHost.querySelector(".picker-item")
+      assert(opt?.textContent?.includes("projects"), `Windows ~ lookup missed projects: ${opt?.textContent}`)
+      const autoBox = pickerHost.querySelector<HTMLInputElement>(".picker-auto input")!
+      autoBox.focus()
+      autoBox.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }))
+      assert(!picker.isOpen, "Escape from auto-approve checkbox did not close picker")
+      assert(outsideBtn.inert === false, "Closing picker left background inert")
+      assert(document.activeElement === outsideBtn, "Closing picker did not restore previous focus")
+    } finally {
+      localStorage.removeItem("occ.model")
+      picker.close()
+      pickerHost.remove()
+      store.stop()
+    }
+  })
+
+  await check("sign-in rejects duplicate submissions while in-flight and toast re-attaches when detached", async () => {
+    const real = window.fetch
+    let posts = 0
+    let finishPost!: (r: Response) => void
+    const root = document.createElement("div")
+    host.append(root)
+    try {
+      window.fetch = ((_input: RequestInfo | URL, init?: RequestInit) => {
+        if (init?.method === "POST") {
+          posts++
+          return new Promise<Response>((resolve) => { finishPost = resolve })
+        }
+        return Promise.resolve(Response.json({ required: true, authenticated: false }))
+      }) as typeof fetch
+      const done = ensureAccess(root)
+      await sleep(20)
+      const form = root.querySelector<HTMLFormElement>("form")!
+      form.querySelector<HTMLInputElement>("input")!.value = "secret"
+      submit(form)
+      submit(form)
+      assert(posts === 1 && form.getAttribute("aria-busy") === "true", "Duplicate sign-in submit sent multiple requests")
+      finishPost(new Response(null, { status: 204 }))
+      assert(await done === true, "Login did not resolve cleanly")
+
+      document.querySelector(".toasts")?.remove()
+      toast("Recovered", 40)
+      const hostEl = document.querySelector(".toasts")
+      assert(!!hostEl && hostEl.isConnected && hostEl.getAttribute("aria-atomic") === "false", "Toast did not re-attach a live host")
+      assert(hostEl!.textContent?.includes("Recovered"), "Toast message missing after re-attach")
+    } finally {
+      window.fetch = real
+      root.remove()
     }
   })
 
